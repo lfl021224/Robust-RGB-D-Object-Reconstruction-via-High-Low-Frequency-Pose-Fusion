@@ -1,0 +1,1568 @@
+# -*- coding: utf-8 -*-
+"""
+GT + ICP (external prior fusion) TSDF reconstruction for TUM RGB-D sequences.
+
+Key points:
+- Maintain a single GLOBAL camera pose T_cw (camera -> GLOBAL).
+- High-frequency relative motion comes from ICP/odometry (prev -> cur): Tij.
+  Update: T_cw <- T_cw @ inv(Tij).
+- Low-frequency absolute prior comes from TUM groundtruth (GT) after time-shift alignment.
+  Fusion: compute correction C = T_gt_aligned @ inv(T_cw), apply a clamped SE(3) step.
+
+This script is a cleaned, self-consistent version based on your latest codebase:
+- Keeps your depth auto-windowing, ORB+PnP init, optional FPFH init, colored ICP + robust P2Plane ICP.
+- Removes the submap/cut logic (to make the “GT+ICP external prior fusion” unambiguous and easier to debug/publish).
+"""
+
+import time
+from pathlib import Path
+import threading
+import queue
+import numpy as np
+import cv2
+import traceback
+import open3d as o3d
+import contextlib
+import io
+import math
+
+# ==========================
+# helpers: twist clamp
+# ==========================
+def clamp_twist(xi, max_r_rad: float, max_t: float):
+    """Clamp se(3) twist: ||w|| <= max_r_rad, ||v|| <= max_t."""
+    xi = np.asarray(xi, dtype=np.float64).copy()
+    w = xi[:3]; v = xi[3:]
+    nw = float(np.linalg.norm(w))
+    if nw > max_r_rad:
+        xi[:3] = w * (max_r_rad / max(1e-12, nw))
+    nv = float(np.linalg.norm(v))
+    if nv > max_t:
+        xi[3:] = v * (max_t / max(1e-12, nv))
+    return xi
+
+# ==========================
+# GT + SE(3) utils
+# ==========================
+def skew(w):
+    wx, wy, wz = w
+    return np.array([[0, -wz, wy],
+                     [wz, 0, -wx],
+                     [-wy, wx, 0]], dtype=np.float64)
+
+def so3_log(R):
+    tr = np.trace(R)
+    cos_theta = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    theta = math.acos(cos_theta)
+    if theta < 1e-8:
+        w = 0.5 * np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]], dtype=np.float64)
+        return w
+    w_hat = (theta / (2.0 * math.sin(theta))) * np.array(
+        [R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]], dtype=np.float64
+    )
+    return w_hat
+
+def so3_exp(w):
+    theta = float(np.linalg.norm(w))
+    K = skew(w)
+    I = np.eye(3, dtype=np.float64)
+    if theta < 1e-8:
+        return I + K
+    A = math.sin(theta) / theta
+    B = (1.0 - math.cos(theta)) / (theta * theta)
+    return I + A * K + B * (K @ K)
+
+def se3_exp(xi):
+    w = np.asarray(xi[:3], dtype=np.float64)
+    v = np.asarray(xi[3:], dtype=np.float64)
+    theta = float(np.linalg.norm(w))
+    R = so3_exp(w)
+    I = np.eye(3, dtype=np.float64)
+    K = skew(w)
+
+    if theta < 1e-8:
+        V = I + 0.5 * K
+    else:
+        A = (1.0 - math.cos(theta)) / (theta * theta)
+        B = (theta - math.sin(theta)) / (theta * theta * theta)
+        V = I + A * K + B * (K @ K)
+
+    t = V @ v
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R
+    T[:3, 3] = t
+    return T
+
+def se3_log(T):
+    R = T[:3,:3]
+    t = T[:3, 3]
+    w = so3_log(R)
+    theta = float(np.linalg.norm(w))
+    I = np.eye(3, dtype=np.float64)
+    K = skew(w)
+
+    if theta < 1e-8:
+        V_inv = I - 0.5 * K
+    else:
+        A = 1.0/(theta*theta)
+        B = (1.0 + math.cos(theta)) / (2.0 * theta * math.sin(theta))
+        V_inv = I - 0.5 * K + (A - B) * (K @ K)
+
+    v = V_inv @ t
+    xi = np.zeros(6, dtype=np.float64)
+    xi[:3] = w
+    xi[3:] = v
+    return xi
+
+def quat_to_R(qx, qy, qz, qw):
+    x, y, z, w = float(qx), float(qy), float(qz), float(qw)
+    n = x*x + y*y + z*z + w*w
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    xx, yy, zz = x*x*s, y*y*s, z*z*s
+    xy, xz, yz = x*y*s, x*z*s, y*z*s
+    wx, wy, wz = w*x*s, w*y*s, w*z*s
+    R = np.array([
+        [1.0 - (yy + zz),       xy - wz,         xz + wy],
+        [      xy + wz,   1.0 - (xx + zz),       yz - wx],
+        [      xz - wy,         yz + wx,   1.0 - (xx + yy)]
+    ], dtype=np.float64)
+    return R
+
+def load_tum_groundtruth(gt_path: Path):
+    if not gt_path.exists():
+        print(f"[gt] not found: {gt_path} (GT fusion disabled)")
+        return None
+    ts = []
+    T_list = []
+    with open(gt_path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if (not ln) or ln.startswith("#"):
+                continue
+            parts = ln.split()
+            if len(parts) < 8:
+                continue
+            t = float(parts[0])
+            tx, ty, tz = map(float, parts[1:4])
+            qx, qy, qz, qw = map(float, parts[4:8])
+            R = quat_to_R(qx, qy, qz, qw)
+            T = np.eye(4, dtype=np.float64)
+            T[:3,:3] = R
+            T[:3, 3] = np.array([tx, ty, tz], dtype=np.float64)
+            ts.append(t)
+            T_list.append(T)
+    if len(ts) < 2:
+        print("[gt] too few samples (GT fusion disabled)")
+        return None
+    ts = np.asarray(ts, dtype=np.float64)
+    return ts, T_list
+
+def query_gt_nearest(gt_data, t_query: float, max_dt: float = 0.02):
+    if gt_data is None:
+        return None
+    ts, T_list = gt_data
+    j = int(np.argmin(np.abs(ts - t_query)))
+    if abs(ts[j] - t_query) > max_dt:
+        return None
+    return T_list[j]
+
+# ==========================
+# Environment
+# ==========================
+HAS_O3D_CUDA = hasattr(o3d, "core") and hasattr(o3d.core, "cuda") and o3d.core.cuda.is_available()
+print(f"[env] Open3D CUDA = {HAS_O3D_CUDA}")
+
+HAS_CV_CUDA = (hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+print(f"[env] OpenCV CUDA = {HAS_CV_CUDA}, devices = {cv2.cuda.getCudaEnabledDeviceCount() if HAS_CV_CUDA else 0}")
+
+# ==========================
+# Switch for ICP only or ICP+GT
+# ==========================
+RUN_MODE = "icp_only"   # "fused" 或 "icp_only"
+ENABLE_GT_FUSION = (RUN_MODE == "fused")
+
+# ==========================
+# Paths (edit here)
+# ==========================
+SEQ_DIR = Path(r"D:\Projects\Underwater\Datasets\TUM_RGBD\rgbd_dataset_freiburg3_cabinet")
+# OUT_DIR = Path(r"D:\Projects\Underwater\Outputs\TUM_RGBD\rgbd_dataset_freiburg3_cabinet_gt_icp_fuse")
+OUT_DIR = Path(r"D:\Projects\Underwater\Outputs\TUM_RGBD\rgbd_dataset_freiburg3_cabinet_" + ("fuse" if ENABLE_GT_FUSION else "icp_only"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+if not SEQ_DIR.exists():
+    raise FileNotFoundError(f"[path] SEQ_DIR 不存在: {SEQ_DIR}")
+
+# ==========================
+# Runtime / display
+# ==========================
+KEYFRAME_STEP     = 2
+LIVE_UPDATE_EVERY = 3
+SHOW_MESH         = False
+
+# ==========================
+# Live visualization (progress demo)
+# ==========================
+VIS_PREVIEW_MODE = "coarse"     # 'coarse' or 'fine' for TSDF extraction
+VIS_UPDATE_EVERY_INTEGRATE = 10  # update Open3D window every N integrations
+VIS_VOXEL_DOWNSAMPLE = 0.03      # downsample for visualization; increase for speed
+VBG_PREVIEW_WEIGHT_THR = 0.0     # VoxelBlockGrid weight threshold for live preview (0.0 shows early results)
+VBG_FINAL_WEIGHT_THR   = 1.0     # threshold for saving final ply (higher -> cleaner, may be sparser)
+
+# Backward-compatible aliases (your older scripts / VSCode linting expect these names)
+LIVE_VIS = True
+LIVE_UPDATE_EVERY_INT = VIS_UPDATE_EVERY_INTEGRATE
+LIVE_VIS_MODE = VIS_PREVIEW_MODE
+LIVE_VIS_VOXEL_DS = VIS_VOXEL_DOWNSAMPLE
+LIVE_VIS_POINT_SIZE = 2.0
+
+
+# ==========================
+# Depth window / ROI
+# ==========================
+NEAR_CLIP      = 0.55
+DEPTH_TRUNC    = 1.60
+USE_CENTER_ROI = False
+ROI_SCALE      = 0.60
+
+# ==========================
+# ICP / Odometry gating
+# ==========================
+MIN_PTS_FOR_ICP   = 1500
+ICP_MIN_FIT_ODO   = 0.35
+ICP_MAX_RMSE_ODO  = 0.015
+ODOM_MAX_T        = 0.10
+ODOM_MAX_R_DEG    = 10
+LOW_OV_THR        = 0.08
+
+# ==========================
+# Init: FPFH / RANSAC
+# ==========================
+USE_FPFH_INIT = True
+FPFH_VOXEL    = 0.025
+RANSAC_DIST   = 0.035
+RANSAC_N_IT   = 30000
+
+# ==========================
+# TSDF params
+# ==========================
+VOXEL_LEN   = 0.008
+SDF_TRUNC_K = 2.0
+
+# ---- GPU TSDF memory controls (VoxelBlockGrid) ----
+# If you hit CUDA OOM at startup, reduce BLOCK_COUNT_* and/or set BLOCK_RES=8 (or 4).
+TSDF_GPU_BLOCK_RES          = 8        # 16 is memory-heavy; 8 is usually enough for object-level scenes
+TSDF_GPU_BLOCK_COUNT_FINE   = 20000    # max active blocks (fine grid)
+TSDF_GPU_BLOCK_COUNT_COARSE = 8000     # max active blocks (coarse grid)
+TSDF_GPU_ENABLE_COARSE      = True     # disable if GPU memory is tight
+TSDF_GPU_OOM_RETRY          = True     # auto retry with smaller settings on OOM
+
+# ==========================
+# Auto depth clip / background
+# ==========================
+AUTO_DEPTH       = True
+AUTO_Q_LOW       = 0.08
+AUTO_Q_HIGH      = 0.75
+AUTO_MARGIN_NEAR = 0.04
+AUTO_MARGIN_FAR  = 0.05
+AUTO_SMOOTH      = 0.7
+AUTO_BG_OTSU     = False
+
+# ==========================
+# GT + ICP external prior fusion
+# ==========================
+FUSE_ALPHA = 0.10
+FUSE_MAX_R_DEG = 1.0
+FUSE_MAX_T = 0.01
+FUSE_REJECT_R_DEG = 45.0
+FUSE_REJECT_T = 0.8
+GT_STRIDE = 2
+GT_MAX_DT = 0.05
+
+TRACK_OV_MIN     = 0.10
+INTEGRATE_OV_MIN = 0.20
+
+# ==========================
+# small utilities
+# ==========================
+class _SilentStderr:
+    def __enter__(self):
+        self._buf = io.StringIO()
+        self._cm = contextlib.redirect_stderr(self._buf)
+        self._cm.__enter__()
+        return self._buf
+    def __exit__(self, exc_type, exc, tb):
+        self._cm.__exit__(exc_type, exc, tb)
+
+def depth_to_meters(depth_raw: np.ndarray):
+    d = depth_raw.astype(np.float32)
+    if d.size == 0:
+        return d
+    if depth_raw.dtype == np.uint16:
+        return d / 5000.0
+    return d
+
+class CudaPreproc:
+    def __init__(self):
+        self.use_cuda = HAS_CV_CUDA
+        if self.use_cuda:
+            try:
+                self.stream = cv2.cuda.Stream()
+                self.orb = cv2.cuda_ORB.create(nfeatures=5000, fastThreshold=7, scaleFactor=1.2, nlevels=8)
+                self.bf = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_HAMMING)
+            except Exception:
+                self.use_cuda = False
+
+    def to_gpu(self, img):
+        g = cv2.cuda_GpuMat()
+        g.upload(img)
+        return g
+
+    def bilateral(self, img32f, d=5, sigmaColor=0.05, sigmaSpace=3):
+        if not self.use_cuda:
+            return cv2.bilateralFilter(img32f, d=d, sigmaColor=sigmaColor, sigmaSpace=sigmaSpace)
+        g = self.to_gpu(img32f)
+        out = cv2.cuda.bilateralFilter(g, -1, sigmaColor, sigmaSpace)
+        return out.download()
+
+    def bgr2rgb(self, img):
+        if not self.use_cuda:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        g = self.to_gpu(img)
+        out = cv2.cuda.cvtColor(g, cv2.COLOR_BGR2RGB)
+        return out.download()
+
+    def orb_match(self, img0_rgb, img1_rgb, max_pts=2500):
+        img0 = cv2.cvtColor(img0_rgb, cv2.COLOR_RGB2BGR)
+        img1 = cv2.cvtColor(img1_rgb, cv2.COLOR_RGB2BGR)
+        if self.use_cuda:
+            g0 = self.to_gpu(img0); g1 = self.to_gpu(img1)
+            kps0, des0 = self.orb.detectAndComputeAsync(g0, None, stream=self.stream)
+            kps1, des1 = self.orb.detectAndComputeAsync(g1, None, stream=self.stream)
+            if des0 is None or des1 is None:
+                return [], None, None
+            matches = self.bf.match(des0, des1)
+            matches = sorted(matches, key=lambda x: x.distance)[:max_pts]
+            kps0 = self.orb.convert(g0, kps0)
+            kps1 = self.orb.convert(g1, kps1)
+            return matches, kps0, kps1
+        else:
+            orb = cv2.ORB_create(nfeatures=5000, fastThreshold=7, scaleFactor=1.2, nlevels=8)
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            kps0, des0 = orb.detectAndCompute(img0, None)
+            kps1, des1 = orb.detectAndCompute(img1, None)
+            if des0 is None or des1 is None:
+                return [], None, None
+            matches = bf.match(des0, des1)
+            matches = sorted(matches, key=lambda x: x.distance)[:max_pts]
+            return matches, kps0, kps1
+
+GP = CudaPreproc()
+
+def _try_float_stem(p: Path):
+    try:
+        return float(p.stem)
+    except Exception:
+        return None
+
+def list_rgbd_paths(seq_dir: Path):
+    for name in ["associations.txt", "associate.txt"]:
+        f = seq_dir / name
+        if f.exists():
+            pairs = []
+            with open(f, "r", encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    parts = ln.split()
+                    if len(parts) >= 4:
+                        _, rgb_rel, _, d_rel = parts[:4]
+                        pairs.append((seq_dir / rgb_rel, seq_dir / d_rel))
+            if not pairs:
+                raise FileNotFoundError(f"{name} 为空")
+            print(f"[io] use {name}, pairs={len(pairs)}")
+            return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    rgb_dir, dep_dir = seq_dir / "rgb", seq_dir / "depth"
+    rgbs = sorted(list(rgb_dir.glob("*.png")) + list(rgb_dir.glob("*.jpg")))
+    deps = sorted(list(dep_dir.glob("*.png")))
+    if not rgbs or not deps:
+        raise FileNotFoundError("未找到 rgb/*.png(jpg) 或 depth/*.png")
+
+    rgb_ts = [(p, _try_float_stem(p)) for p in rgbs]
+    dep_ts = [(p, _try_float_stem(p)) for p in deps]
+    rgb_ts = [(p, t) for p, t in rgb_ts if t is not None]
+    dep_ts = [(p, t) for p, t in dep_ts if t is not None]
+    if not rgb_ts or not dep_ts:
+        raise RuntimeError("文件名不是时间戳，且没有 associations.txt")
+
+    dep_times = np.array([t for _, t in dep_ts], dtype=np.float64)
+    pairs = []
+    for p_rgb, t in rgb_ts:
+        j = int(np.argmin(np.abs(dep_times - t)))
+        if abs(dep_times[j] - t) <= 0.050:
+            pairs.append((p_rgb, dep_ts[j][0]))
+    if not pairs:
+        raise RuntimeError("时间最近配对失败（阈值太严格？）")
+    print(f"[io] timestamp-nearest pairing: pairs={len(pairs)} (rgb={len(rgbs)}, depth={len(deps)})")
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+def make_rgbd(color_path: Path, depth_path: Path,
+              depth_trunc=DEPTH_TRUNC, near_clip=NEAR_CLIP,
+              use_center_roi: bool = True):
+    c = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
+    d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    if c is None or d is None:
+        raise FileNotFoundError(f"读取失败: {color_path.name}, {depth_path.name}")
+
+    dm = depth_to_meters(d).astype(np.float32)
+    dm[(dm < near_clip) | (dm > depth_trunc) | ~np.isfinite(dm)] = 0.0
+
+    if (dm > 0).any():
+        dm_f = GP.bilateral(dm, d=5, sigmaColor=0.05, sigmaSpace=3)
+        dm[dm > 0] = dm_f[dm > 0]
+
+    if use_center_roi:
+        H, W = dm.shape
+        xs, ys = np.meshgrid(np.arange(W), np.arange(H))
+        cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+        rx, ry = ROI_SCALE * W, ROI_SCALE * H
+        mask = ((xs - cx) ** 2) / (rx ** 2) + ((ys - cy) ** 2) / (ry ** 2) <= 1.0
+        dm[~mask] = 0.0
+
+    color_rgb = GP.bgr2rgb(c)
+    return color_rgb, dm
+
+def build_o3d_rgbd(color_rgb: np.ndarray, dm: np.ndarray, depth_trunc: float):
+    return o3d.geometry.RGBDImage.create_from_color_and_depth(
+        o3d.geometry.Image(color_rgb),
+        o3d.geometry.Image(dm.astype(np.float32)),
+        depth_scale=1.0,
+        depth_trunc=float(depth_trunc),
+        convert_rgb_to_intensity=False
+    )
+
+def make_pcd_from_rgbd_o3d(rgbd, intr, voxel=0.014):
+    pc = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intr)
+    if voxel > 0:
+        pc = pc.voxel_down_sample(voxel)
+    return pc
+
+def _is_planar_xyz(X, thr=1e-2, min_n=20):
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] < min_n:
+        return False
+    Xc = X - X.mean(axis=0, keepdims=True)
+    try:
+        _, s, _ = np.linalg.svd(Xc, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return True
+    denom = float(s.sum())
+    if denom <= 1e-9:
+        return True
+    return float(s[-1] / denom) < thr
+
+def orb_pnp_init_cuda(color_prev_rgb, depth_prev_m, color_cur_rgb, intr_mat,
+                      max_pts=2500):
+    matches, kps0, kps1 = GP.orb_match(color_prev_rgb, color_cur_rgb, max_pts=max_pts)
+    if not matches:
+        return None
+
+    fx, fy, cx, cy = intr_mat[0, 0], intr_mat[1, 1], intr_mat[0, 2], intr_mat[1, 2]
+    objp, imgp = [], []
+    dep = depth_prev_m
+    zz = dep[(dep > 0) & np.isfinite(dep)]
+    if zz.size > 100:
+        zmin = float(np.quantile(zz, 0.05)); zmax = float(np.quantile(zz, 0.95))
+        zmin = max(zmin, 0.2); zmax = min(zmax, 6.0)
+    else:
+        zmin, zmax = 0.2, 6.0
+
+    for mm in matches:
+        u0, v0 = kps0[mm.queryIdx].pt
+        u1, v1 = kps1[mm.trainIdx].pt
+        z = dep[int(round(v0)), int(round(u0))]
+        if not np.isfinite(z) or z <= zmin or z >= zmax:
+            continue
+        X = (u0 - cx) * z / fx
+        Y = (v0 - cy) * z / fy
+        objp.append([X, Y, z])
+        imgp.append([u1, v1])
+
+    if len(objp) < 40:
+        return None
+
+    objp = np.asarray(objp, np.float32)
+    imgp = np.asarray(imgp, np.float32)
+
+    if _is_planar_xyz(objp, thr=0.010):
+        return None
+
+    K = intr_mat.astype(np.float64)
+    ok, rvec, tvec, _ = cv2.solvePnPRansac(
+        objp, imgp, K, None,
+        iterationsCount=1500,
+        reprojectionError=2.5,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = tvec.reshape(3)
+    return T
+
+def angle_from_R(R: np.ndarray) -> float:
+    t = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(t)))
+
+def reasonable(T: np.ndarray, max_t: float, max_r_deg: float) -> bool:
+    return (np.linalg.norm(T[:3, 3]) <= max_t) and (angle_from_R(T[:3, :3]) <= max_r_deg)
+
+def fast_overlap_xform(src_pts, dst_pts, T, grid=0.03, sample_n=2000):
+    if src_pts.shape[0] == 0 or dst_pts.shape[0] == 0:
+        return 0.0
+    ids = np.random.choice(src_pts.shape[0], size=min(sample_n, src_pts.shape[0]), replace=False)
+    src = src_pts[ids]
+    src = (src @ T[:3, :3].T) + T[:3, 3]
+
+    def g(P):
+        Q = np.floor(P / grid)
+        return (Q[:, 0] * 73856093 + Q[:, 1] * 19349663 + Q[:, 2] * 83492791).astype(np.int64)
+
+    g_dst = set(g(dst_pts).tolist())
+    hit = sum((v in g_dst) for v in g(src))
+    return hit / max(1, len(ids))
+
+def estimate_depth_bounds_for_file(depth_path: Path, prev_near: float, prev_far: float):
+    d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    if d is None:
+        return prev_near, prev_far
+    dm = depth_to_meters(d).astype(np.float32)
+    z = dm[(dm > 0) & np.isfinite(dm)]
+    if z.size < 500:
+        return prev_near, prev_far
+    ql = float(np.quantile(z, AUTO_Q_LOW))
+    qh = float(np.quantile(z, AUTO_Q_HIGH))
+    near = max(0.05, ql - AUTO_MARGIN_NEAR)
+    far  = max(near + 0.10, qh + AUTO_MARGIN_FAR)
+    near = AUTO_SMOOTH * prev_near + (1.0 - AUTO_SMOOTH) * near
+    far  = AUTO_SMOOTH * prev_far  + (1.0 - AUTO_SMOOTH) * far
+    far  = max(far, near + 0.10)
+    return near, far
+
+def cut_background_otsu(dm: np.ndarray):
+    z = dm[(dm > 0) & np.isfinite(dm)]
+    if z.size < 1000:
+        return dm
+    lo = float(np.quantile(z, 0.02)); hi = float(np.quantile(z, 0.98))
+    if hi <= lo + 1e-6:
+        return dm
+    s = np.clip((dm - lo) / (hi - lo), 0.0, 1.0)
+    s8 = (s * 255).astype(np.uint8)
+    _, thr = cv2.threshold(s8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    keep = s8 <= thr
+    if keep.sum() < 0.25 * s8.size:
+        keep = ~keep
+    dm[~keep] = 0.0
+    return dm
+
+def _is_low_texture_or_planar(color_rgb: np.ndarray, dm: np.ndarray,
+                              pts_prev: np.ndarray, pts_cur: np.ndarray):
+    planar = _is_planar_xyz(pts_prev, 0.010) and _is_planar_xyz(pts_cur, 0.010)
+    g = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2GRAY)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    texture = float(np.mean(np.hypot(gx, gy)))
+    low_tex = texture < 8.0
+    return planar or low_tex
+
+def load_intrinsics_dataset_aware(w: int, h: int, seq_root: Path):
+    root_str = str(seq_root).lower()
+    if "fr1" in root_str:
+        fx, fy, cx, cy = 517.3, 516.5, 318.6, 255.3
+    elif "fr2" in root_str:
+        fx, fy, cx, cy = 520.9, 521.0, 325.1, 249.7
+    elif "fr3" in root_str:
+        fx, fy, cx, cy = 535.4, 539.2, 320.1, 247.6
+    else:
+        sfx = 525.0 * (w / 640.0)
+        sfy = 525.0 * (h / 480.0)
+        fx, fy = sfx, sfy
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    return dict(fx=fx, fy=fy, cx=cx, cy=cy)
+
+
+class TSDFWrapper:
+    """TSDF wrapper with version-tolerant GPU backends.
+
+    GPU preference order:
+      1) o3d.t.geometry.TSDFVoxelGrid (some Open3D builds)
+      2) o3d.t.geometry.VoxelBlockGrid (most recent CUDA builds)
+
+    Notes:
+      - The previous OOM was caused by huge block_count values (e.g., 120k/80k with block_resolution=16).
+        This wrapper defaults to block_resolution=8 and much smaller block counts.
+      - If coarse grid cannot be allocated, we keep running with fine grid only.
+    """
+
+    def __init__(self,
+                 voxel_len: float,
+                 sdf_trunc: float,
+                 coarse_factor: float = 3.0,
+                 fuse_mode: str = "holefill",
+                 fuse_voxel: float = None,
+                 hole_dist: float = None,
+                 fuse_alpha: float = 0.6,
+                 fuse_clamp: float = 0.02):
+
+        self.request_gpu = bool(HAS_O3D_CUDA)
+        self.mode = "gpu" if self.request_gpu else "cpu"
+        self.backend = "legacy"
+
+        self.voxel_fine = float(voxel_len)
+        self.voxel_coarse = float(voxel_len) * max(1.0, float(coarse_factor))
+        self.sdf_trunc_fine = float(sdf_trunc)
+        self.sdf_trunc_coarse = float(sdf_trunc) * max(1.0, float(coarse_factor))
+
+        self.fuse_mode = (fuse_mode or "holefill").lower()
+        self.fuse_voxel = float(fuse_voxel) if (fuse_voxel is not None) else (self.voxel_fine * 1.2)
+        self.hole_dist = float(hole_dist) if (hole_dist is not None) else (self.voxel_coarse * 0.9)
+        self.fuse_alpha = float(fuse_alpha)
+        self.fuse_clamp = float(fuse_clamp)
+
+        self.grid_fine = None
+        self.grid_coarse = None
+
+        # For VoxelBlockGrid, truncation is controlled by 'trunc_voxel_multiplier'
+        self.trunc_mult_fine = max(1.0, self.sdf_trunc_fine / max(1e-9, self.voxel_fine))
+        self.trunc_mult_coarse = max(1.0, self.sdf_trunc_coarse / max(1e-9, self.voxel_coarse))
+
+        if self.mode == "gpu":
+            self.dev = o3d.core.Device("CUDA:0")
+
+            # ---------- Backend A: TSDFVoxelGrid (if present) ----------
+            if hasattr(o3d.t.geometry, "TSDFVoxelGrid"):
+                try:
+                    self.grid_fine = o3d.t.geometry.TSDFVoxelGrid(
+                        voxel_size=self.voxel_fine,
+                        sdf_trunc=self.sdf_trunc_fine,
+                        device=self.dev
+                    )
+                    self.grid_coarse = o3d.t.geometry.TSDFVoxelGrid(
+                        voxel_size=self.voxel_coarse,
+                        sdf_trunc=self.sdf_trunc_coarse,
+                        device=self.dev
+                    )
+                    self.backend = "tsdf_voxel_grid"
+                except Exception:
+                    self.grid_fine = None
+                    self.grid_coarse = None
+
+            # ---------- Backend B: VoxelBlockGrid (recommended) ----------
+            if (self.grid_fine is None) and hasattr(o3d.t.geometry, "VoxelBlockGrid"):
+                self.backend = "voxel_block_grid"
+
+                def _release_cuda_cache():
+                    # best-effort cache release across versions
+                    try:
+                        if hasattr(o3d.core, "cuda") and hasattr(o3d.core.cuda, "release_cache"):
+                            o3d.core.cuda.release_cache()
+                    except Exception:
+                        pass
+
+                def _oom(e: Exception) -> bool:
+                    msg = str(e).lower()
+                    return ("out of memory" in msg) or ("cuda runtime error" in msg) or ("memorymanagercuda" in msg)
+
+                def _make_vbg(voxel_size: float, block_res: int, block_count: int):
+                    """Create a TSDF-capable VoxelBlockGrid with float tsdf/weight/color.
+
+                    Many Open3D CUDA builds only instantiate TSDF kernels for:
+                      - (float depth, float color)  + (float tsdf, float weight, float color), or
+                      - (uint16 depth, uint16 color) + (uint16 tsdf, uint16 weight, uint16 color).
+
+                    This project uses float32 depth (meters), so we force the all-float path here.
+                    """
+                    attr_names = ("tsdf", "weight", "color")
+                    attr_dtypes = (o3d.core.Dtype.Float32, o3d.core.Dtype.Float32, o3d.core.Dtype.Float32)
+                    attr_channels = (1, 1, 3)
+
+                    # Newer signature (keyword args)
+                    try:
+                        return o3d.t.geometry.VoxelBlockGrid(
+                            attr_names=attr_names,
+                            attr_dtypes=attr_dtypes,
+                            attr_channels=attr_channels,
+                            voxel_size=float(voxel_size),
+                            block_resolution=int(block_res),
+                            block_count=int(block_count),
+                            device=self.dev
+                        )
+                    except TypeError:
+                        pass
+
+                    # Older signature (positional args)
+                    try:
+                        return o3d.t.geometry.VoxelBlockGrid(
+                            attr_names, attr_dtypes, attr_channels,
+                            voxel_size=float(voxel_size),
+                            block_resolution=int(block_res),
+                            block_count=int(block_count),
+                            device=self.dev
+                        )
+                    except TypeError:
+                        pass
+
+                    # Some custom builds accept dict-style dtypes
+                    try:
+                        return o3d.t.geometry.VoxelBlockGrid(
+                            {"tsdf": o3d.core.Dtype.Float32,
+                             "weight": o3d.core.Dtype.Float32,
+                             "color": o3d.core.Dtype.Float32},
+                            voxel_size=float(voxel_size),
+                            block_resolution=int(block_res),
+                            block_count=int(block_count),
+                            device=self.dev
+                        )
+                    except Exception as e:
+                        raise RuntimeError(f"VoxelBlockGrid constructor mismatch: {repr(e)}")
+
+                # try a sequence of settings (large -> small) if OOM
+                res0 = int(max(4, TSDF_GPU_BLOCK_RES))
+                fine0 = int(max(1000, TSDF_GPU_BLOCK_COUNT_FINE))
+                coarse0 = int(max(500, TSDF_GPU_BLOCK_COUNT_COARSE))
+
+                candidates = [(res0, fine0, coarse0)]
+                if TSDF_GPU_OOM_RETRY:
+                    candidates += [
+                        (res0, max(2000, fine0 // 2), max(1000, coarse0 // 2)),
+                        (res0, max(2000, fine0 // 4), max(1000, coarse0 // 4)),
+                        (max(4, res0 // 2), max(1500, fine0 // 4), max(800, coarse0 // 4)),
+                        (max(4, res0 // 2), max(1200, fine0 // 8), max(600, coarse0 // 8)),
+                    ]
+
+                last_err = None
+                for br, bc_f, bc_c in candidates:
+                    try:
+                        self.grid_fine = _make_vbg(self.voxel_fine, br, bc_f)
+                        # coarse grid is optional
+                        if TSDF_GPU_ENABLE_COARSE:
+                            try:
+                                self.grid_coarse = _make_vbg(self.voxel_coarse, br, bc_c)
+                            except Exception as e2:
+                                if _oom(e2):
+                                    _release_cuda_cache()
+                                    self.grid_coarse = None
+                                else:
+                                    raise
+                        else:
+                            self.grid_coarse = None
+
+                        print(f"[tsdf-gpu] VoxelBlockGrid ok: block_res={br}, fine_blocks={bc_f}, coarse_blocks={bc_c if self.grid_coarse is not None else 0}")
+                        last_err = None
+                        break
+
+                    except Exception as e:
+                        last_err = e
+                        if _oom(e):
+                            print(f"[tsdf-gpu] OOM during VoxelBlockGrid alloc -> retry smaller (block_res={br}, fine={bc_f}, coarse={bc_c})")
+                            _release_cuda_cache()
+                            self.grid_fine = None
+                            self.grid_coarse = None
+                            continue
+                        else:
+                            raise
+
+                if self.grid_fine is None:
+                    print(f"[tsdf-gpu] Failed to allocate GPU TSDF (VoxelBlockGrid). Fallback to CPU. last_err={repr(last_err)}")
+                    self.mode = "cpu"
+                    self.backend = "legacy"
+
+            # If neither backend succeeded
+            if self.grid_fine is None and self.mode == "gpu":
+                print("[tsdf-gpu] No compatible GPU TSDF backend; fallback to CPU")
+                self.mode = "cpu"
+                self.backend = "legacy"
+
+        # ---------- CPU legacy backend ----------
+        if self.mode == "cpu":
+            self.grid_fine = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=self.voxel_fine,
+                sdf_trunc=self.sdf_trunc_fine,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+            )
+            self.grid_coarse = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=self.voxel_coarse,
+                sdf_trunc=self.sdf_trunc_coarse,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+            )
+
+    # --------------------------
+    # VoxelBlockGrid helpers
+    # --------------------------
+    @staticmethod
+    def _activate_blocks_if_needed(grid, block_coords):
+        """Activate voxel blocks for VoxelBlockGrid if the build requires it.
+
+        Some Open3D CUDA builds return block coordinates on CPU even when the grid lives on CUDA.
+        We therefore try activation on the given tensor first; if it fails, we retry after moving it
+        to the grid/hashmap device.
+        """
+        if grid is None or block_coords is None:
+            return
+        try:
+            hm = grid.hashmap() if hasattr(grid, "hashmap") else None
+            if hm is None or (not hasattr(hm, "activate")):
+                return
+            try:
+                hm.activate(block_coords)
+                return
+            except Exception:
+                # retry on grid device
+                try:
+                    dev = grid.device if hasattr(grid, "device") else (hm.device if hasattr(hm, "device") else None)
+                    if dev is not None and hasattr(block_coords, "to"):
+                        hm.activate(block_coords.to(dev))
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def integrate(self, color_rgb: np.ndarray, depth_m: np.ndarray,
+                  K_3x3: np.ndarray, intr_legacy, T_cw: np.ndarray, depth_max: float):
+        """Integrate one RGB-D frame.
+
+        Inputs:
+          - T_cw: camera->world (the pose you track/fuse)
+        """
+        if self.mode == "gpu":
+            # Open3D tensor images
+            # NOTE:
+            #   VoxelBlockGrid TSDF integrate kernel (Open3D-t) supports ONLY two input dtype pairs:
+            #     (depth=float, color=float)  OR  (depth=uint16, color=uint8)
+            #   Our pipeline uses depth_m in meters (float32) + color_rgb uint8.
+            #   Therefore we convert color to float32 in [0,1] to satisfy (float, float).
+            depth_np = depth_m
+            if depth_np.dtype != np.float32:
+                depth_np = depth_np.astype(np.float32, copy=False)
+
+            color_np = color_rgb
+            if color_np.dtype != np.float32:
+                # uint8 -> float32 [0,1]
+                color_np = (color_np.astype(np.float32) / 255.0)
+
+            depth_t = o3d.t.geometry.Image(
+                o3d.core.Tensor(depth_np, dtype=o3d.core.Dtype.Float32, device=self.dev)
+            )
+            color_t = o3d.t.geometry.Image(
+                o3d.core.Tensor(color_np, dtype=o3d.core.Dtype.Float32, device=self.dev)
+            )
+            # NOTE: Some Open3D CUDA builds expect intrinsics/extrinsics on CPU (even if images are on CUDA).
+            if self.backend == "voxel_block_grid":
+                K_t = o3d.core.Tensor(K_3x3, dtype=o3d.core.Dtype.Float64)  # CPU:0
+                ext_t = o3d.core.Tensor(np.linalg.inv(T_cw), dtype=o3d.core.Dtype.Float64)  # CPU:0
+            else:
+                K_t = o3d.core.Tensor(K_3x3, dtype=o3d.core.Dtype.Float64, device=self.dev)
+                ext_t = o3d.core.Tensor(np.linalg.inv(T_cw), dtype=o3d.core.Dtype.Float64, device=self.dev)
+
+            if self.backend == "tsdf_voxel_grid":
+                self.grid_fine.integrate(depth_t, color_t, K_t, ext_t, depth_scale=1.0, depth_max=float(depth_max))
+                if self.grid_coarse is not None:
+                    self.grid_coarse.integrate(depth_t, color_t, K_t, ext_t, depth_scale=1.0, depth_max=float(depth_max))
+                return
+
+            if self.backend == "voxel_block_grid":
+                def _do(grid, trunc_mult: float):
+                    if grid is None:
+                        return
+                    try:
+                        bc = grid.compute_unique_block_coordinates(
+                            depth_t, K_t, ext_t,
+                            depth_scale=1.0, depth_max=float(depth_max)
+                        )
+                    except TypeError:
+                        # API variation: sometimes expects (depth, intrinsic, extrinsic, ...)
+                        bc = grid.compute_unique_block_coordinates(
+                            depth_t, K_t, ext_t
+                        )
+                    # Some builds return block coords on CPU; move to grid device (CUDA) if possible.
+                    try:
+                        if hasattr(bc, "to"):
+                            bc = bc.to(self.dev)
+                    except Exception:
+                        pass
+                    self._activate_blocks_if_needed(grid, bc)
+
+                    # integrate (handle API differences)
+                    try:
+                        grid.integrate(
+                            bc, depth_t, color_t, K_t, ext_t,
+                            depth_scale=1.0, depth_max=float(depth_max),
+                            trunc_voxel_multiplier=float(trunc_mult)
+                        )
+                    except TypeError:
+                        try:
+                            grid.integrate(
+                                bc, depth_t, color_t, K_t, ext_t,
+                                depth_scale=1.0, depth_max=float(depth_max)
+                            )
+                        except TypeError:
+                            grid.integrate(
+                                bc, depth_t, color_t, K_t, K_t, ext_t,
+                                depth_scale=1.0, depth_max=float(depth_max)
+                            )
+
+                _do(self.grid_fine, self.trunc_mult_fine)
+                _do(self.grid_coarse, self.trunc_mult_coarse)
+                return
+
+            # should not reach here
+            raise RuntimeError("[tsdf] GPU mode but unknown backend")
+
+        # CPU fallback
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color_rgb),
+            o3d.geometry.Image(depth_m.astype(np.float32)),
+            depth_scale=1.0,
+            depth_trunc=float(depth_max),
+            convert_rgb_to_intensity=False
+        )
+        Twc = np.linalg.inv(T_cw)
+        self.grid_fine.integrate(rgbd, intr_legacy, Twc)
+        if self.grid_coarse is not None:
+            self.grid_coarse.integrate(rgbd, intr_legacy, Twc)
+
+    def _extract_legacy_pcds(self, weight_thr: float):
+        """Return (fine, coarse) legacy point clouds.
+
+        weight_thr is only used by Open3D-t GPU backends (TSDFVoxelGrid / VoxelBlockGrid).
+        For the legacy CPU ScalableTSDFVolume backend, the parameter is ignored.
+        """
+        empty = o3d.geometry.PointCloud()
+        wthr = float(weight_thr)
+
+        if self.mode == "gpu":
+            if self.backend == "tsdf_voxel_grid":
+                # Some builds support weight_threshold kwarg, some don't.
+                try:
+                    pc_fine = self.grid_fine.extract_point_cloud(weight_threshold=wthr).to_legacy()
+                except TypeError:
+                    pc_fine = self.grid_fine.extract_point_cloud().to_legacy()
+
+                if self.grid_coarse is not None:
+                    try:
+                        pc_coarse = self.grid_coarse.extract_point_cloud(weight_threshold=wthr).to_legacy()
+                    except TypeError:
+                        pc_coarse = self.grid_coarse.extract_point_cloud().to_legacy()
+                else:
+                    pc_coarse = empty
+
+                return pc_fine, pc_coarse
+
+            if self.backend == "voxel_block_grid":
+                try:
+                    pc_fine = self.grid_fine.extract_point_cloud(weight_threshold=wthr).to_legacy()
+                except TypeError:
+                    pc_fine = self.grid_fine.extract_point_cloud().to_legacy()
+
+                if self.grid_coarse is not None:
+                    try:
+                        pc_coarse = self.grid_coarse.extract_point_cloud(weight_threshold=wthr).to_legacy()
+                    except TypeError:
+                        pc_coarse = self.grid_coarse.extract_point_cloud().to_legacy()
+                else:
+                    pc_coarse = empty
+
+                return pc_fine, pc_coarse
+
+        # CPU legacy backend
+        pc_fine = self.grid_fine.extract_point_cloud()
+        pc_coarse = self.grid_coarse.extract_point_cloud() if (self.grid_coarse is not None) else empty
+        return pc_fine, pc_coarse
+
+    def extract_point_cloud(self, mode: str = None, weight_thr: float = None) -> o3d.geometry.PointCloud:
+        """Extract a point cloud for visualization or saving.
+
+        Parameters
+        ----------
+        mode:
+            'fine' | 'coarse' | 'merge' | 'holefill' (default uses self.fuse_mode)
+        weight_thr:
+            For GPU TSDF backends, controls extraction sparsity. For live preview, set 0.0.
+            For final saving, you can set 1.0~3.0 for cleaner surfaces.
+        """
+        mode = (mode or self.fuse_mode).lower()
+        wthr = float(VBG_FINAL_WEIGHT_THR if (weight_thr is None) else weight_thr)
+
+        pc_f, pc_c = self._extract_legacy_pcds(wthr)
+
+        if mode == "fine":
+            return pc_f
+        if mode == "coarse":
+            return pc_c if len(pc_c.points) > 0 else pc_f
+
+        if len(pc_f.points) == 0:
+            return pc_c
+        if len(pc_c.points) == 0:
+            return pc_f
+
+        if mode == "merge":
+            pc_all = pc_f + pc_c
+            return pc_all.voxel_down_sample(self.fuse_voxel) if self.fuse_voxel > 0 else pc_all
+
+        if mode in ("holefill", "fused"):
+            d = np.asarray(pc_c.compute_point_cloud_distance(pc_f), dtype=np.float32)
+            keep = np.where(d > self.hole_dist)[0]
+            pc_fill = pc_c.select_by_index(keep) if keep.size > 0 else o3d.geometry.PointCloud()
+            pc_all = pc_f + pc_fill
+            return pc_all.voxel_down_sample(self.fuse_voxel) if self.fuse_voxel > 0 else pc_all
+
+        # fallback
+        return pc_f
+    def extract_triangle_mesh(self, which: str = "fine") -> o3d.geometry.TriangleMesh:
+        which = (which or "fine").lower()
+        if self.mode == "gpu":
+            if self.backend == "tsdf_voxel_grid":
+                if which == "coarse" and self.grid_coarse is not None:
+                    return self.grid_coarse.extract_triangle_mesh().to_legacy()
+                return self.grid_fine.extract_triangle_mesh().to_legacy()
+            if self.backend == "voxel_block_grid":
+                if which == "coarse" and self.grid_coarse is not None:
+                    return self.grid_coarse.extract_triangle_mesh(weight_threshold=1.0).to_legacy()
+                return self.grid_fine.extract_triangle_mesh(weight_threshold=1.0).to_legacy()
+
+        if which == "coarse" and self.grid_coarse is not None:
+            return self.grid_coarse.extract_triangle_mesh()
+        return self.grid_fine.extract_triangle_mesh()
+
+
+class FrameLoader(threading.Thread):
+    def __init__(self, colors, depths):
+        super().__init__(daemon=True)
+        self.colors = colors
+        self.depths = depths
+        self.q = queue.Queue(maxsize=4)
+        self.stop_flag = False
+        self.auto_near = NEAR_CLIP
+        self.auto_far = DEPTH_TRUNC
+
+    def run(self):
+        try:
+            for cpath, dpath in zip(self.colors, self.depths):
+                if self.stop_flag:
+                    break
+                if AUTO_DEPTH:
+                    self.auto_near, self.auto_far = estimate_depth_bounds_for_file(dpath, self.auto_near, self.auto_far)
+                    color_rgb, dm = make_rgbd(cpath, dpath, depth_trunc=self.auto_far, near_clip=self.auto_near, use_center_roi=USE_CENTER_ROI)
+                    if AUTO_BG_OTSU:
+                        dm = cut_background_otsu(dm)
+                    self.q.put((cpath.name, dpath.name, color_rgb, dm, self.auto_near, self.auto_far))
+                else:
+                    color_rgb, dm = make_rgbd(cpath, dpath, depth_trunc=DEPTH_TRUNC, near_clip=NEAR_CLIP, use_center_roi=USE_CENTER_ROI)
+                    self.q.put((cpath.name, dpath.name, color_rgb, dm, NEAR_CLIP, DEPTH_TRUNC))
+        except Exception as e:
+            self.q.put(("__ERR__", str(e), None, None, None, None))
+
+def colored_icp_multiscale(src, dst, init=np.eye(4)):
+    T = init.copy()
+    def prep(pcd, v):
+        q = pcd.voxel_down_sample(v)
+        if len(q.points) == 0:
+            return q
+        q.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=v * 3, max_nn=48))
+        q.orient_normals_towards_camera_location(np.array([0, 0, 0], dtype=np.float64))
+        return q
+    scales = [0.06, 0.04, 0.02]
+    dists  = [0.12, 0.08, 0.05]
+    reg_last = None
+    for v, corr in zip(scales, dists):
+        src_lvl = prep(src, v)
+        dst_lvl = prep(dst, v)
+        if len(src_lvl.points) < 300 or len(dst_lvl.points) < 300:
+            return None
+        try:
+            with _SilentStderr():
+                reg = o3d.pipelines.registration.registration_colored_icp(
+                    src_lvl, dst_lvl, corr, T,
+                    o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=12)
+                )
+        except Exception:
+            reg = None
+        if reg is None:
+            continue
+        T = reg.transformation
+        reg_last = reg
+    return reg_last
+
+def icp_point2plane_multiscale_robust(pc_prev, pc_cur, init=np.eye(4)):
+    T = init.copy()
+    pyr = [(0.08, 0.20, 20), (0.04, 0.12, 30), (0.02, 0.08, 50)]
+    loss = o3d.pipelines.registration.TukeyLoss(k=0.03)
+    est = o3d.pipelines.registration.TransformationEstimationPointToPlane(loss)
+    reg_last = None
+    for vxl, radius, it in pyr:
+        sp = pc_prev.voxel_down_sample(vxl)
+        dp = pc_cur.voxel_down_sample(vxl)
+        if len(sp.points) < 300 or len(dp.points) < 300:
+            return reg_last
+        sp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
+        dp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
+        reg = o3d.pipelines.registration.registration_icp(sp, dp, radius, T, est, o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=it))
+        if reg is None:
+            break
+        T = reg.transformation
+        reg_last = reg
+    return reg_last
+
+def gt_fuse_pose(T_cw_est, T_gt_aligned):
+    C_full = T_gt_aligned @ np.linalg.inv(T_cw_est)
+    xi = se3_log(C_full)
+    err_r = float(np.linalg.norm(xi[:3]))
+    err_t = float(np.linalg.norm(xi[3:]))
+    if (err_r > np.deg2rad(float(FUSE_REJECT_R_DEG))) or (err_t > float(FUSE_REJECT_T)):
+        return T_cw_est, False, err_r, err_t
+    xi_step = clamp_twist(xi * float(FUSE_ALPHA), max_r_rad=np.deg2rad(float(FUSE_MAX_R_DEG)), max_t=float(FUSE_MAX_T))
+    C_step = se3_exp(xi_step)
+    return (C_step @ T_cw_est), True, err_r, err_t
+
+def debug_check_can_depth(rgb_path, depth_path, depth_scale=5000.0, wait_ms=0):
+    """
+    交互式框选 ROI(可乐罐)，统计该区域有效深度占比与深度分布。
+    - rgb_path: 当前帧彩色图路径
+    - depth_path: 当前帧深度图路径 (TUM: uint16 mm)
+    - depth_scale: depth(u16)/depth_scale -> meters
+    """
+    rgb = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+    dep_u16 = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+
+    if rgb is None:
+        raise FileNotFoundError(f"RGB read failed: {rgb_path}")
+    if dep_u16 is None:
+        raise FileNotFoundError(f"Depth read failed: {depth_path}")
+
+    # depth -> meters
+    if dep_u16.dtype != np.uint16:
+        print(f"[warn] depth dtype={dep_u16.dtype}, expected uint16 for TUM; still proceeding.")
+    dep_m = dep_u16.astype(np.float32) / float(depth_scale)
+
+    disp = rgb.copy()
+    cv2.putText(disp, "Select ROI around the coke can, then press ENTER/SPACE",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    # 交互框选 ROI
+    x, y, w, h = cv2.selectROI("ROI selector", disp, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow("ROI selector")
+    x, y, w, h = int(x), int(y), int(w), int(h)
+
+    if w <= 2 or h <= 2:
+        print("[roi] invalid ROI selected.")
+        return
+
+    roi_dep = dep_m[y:y+h, x:x+w]
+    valid = roi_dep > 1e-6
+    valid_ratio = float(valid.mean())
+    valid_vals = roi_dep[valid]
+
+    print("\n================ ROI Depth Check ================")
+    print(f"[roi] x={x}, y={y}, w={w}, h={h}")
+    print(f"[depth] valid_ratio(depth>0) = {valid_ratio*100:.2f}%")
+
+    if valid_vals.size == 0:
+        print("[depth] ROI has NO valid depth. TSDF cannot reconstruct the can geometry.")
+        print("       -> likely specular/reflective surface or sensor failure in that region.")
+        return
+
+    # 统计
+    med = float(np.median(valid_vals))
+    mean = float(np.mean(valid_vals))
+    mn = float(np.min(valid_vals))
+    mx = float(np.max(valid_vals))
+    print(f"[depth] meters: median={med:.4f}, mean={mean:.4f}, min={mn:.4f}, max={mx:.4f}")
+    print("[hint] 如果 valid_ratio < 5% 或者 median 深度不稳定，通常 TSDF 很难建出罐体（只能建背景/桌面）。")
+    print("=================================================\n")
+
+    # 可视化：把有效深度 mask 叠加看一眼
+    mask = (valid.astype(np.uint8) * 255)
+    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    overlay = cv2.addWeighted(rgb[y:y+h, x:x+w], 0.7, mask_vis, 0.3, 0)
+
+    cv2.imshow("RGB ROI", rgb[y:y+h, x:x+w])
+    cv2.imshow("ValidDepthMask ROI", mask)
+    cv2.imshow("Overlay ROI", overlay)
+
+    if wait_ms <= 0:
+        cv2.waitKey(0)
+    else:
+        cv2.waitKey(wait_ms)
+    cv2.destroyAllWindows()
+
+def main():
+    colors, depths = list_rgbd_paths(SEQ_DIR)
+    total = len(colors)
+
+    # ---------- GT ----------
+    gt_data = load_tum_groundtruth(SEQ_DIR / "groundtruth.txt")
+    # USE_GT = (gt_data is not None)
+    USE_GT = False
+    
+    # ---------- Bootstrap: find a start frame with enough valid depth ----------
+    start = 0
+    did_roi_check = False 
+    near0, far0 = 0.15, 5.0
+    while start < len(colors):
+        c0, d0 = colors[start], depths[start]
+
+        # 只做一次交互式 ROI 深度检查（你可以改成每N帧一次）
+        if not did_roi_check:
+            debug_check_can_depth(c0, d0, depth_scale=5000.0)  # 如果你代码里有 DEPTH_SCALE 就替换
+            did_roi_check = True
+    
+        near0, far0 = estimate_depth_bounds_for_file(d0, near0, far0)
+        color0_rgb, dm0 = make_rgbd(c0, d0, depth_trunc=far0, near_clip=near0, use_center_roi=False)
+        z0 = dm0[(dm0 > 0) & np.isfinite(dm0)]
+        print(f"[bootstrap] k0={start}, nz={z0.size}, near={near0:.2f}, far={far0:.2f}")
+        if z0.size >= 3000:
+            break
+        start += 1
+    if start == len(colors):
+        raise RuntimeError("没有找到有效深度的起始帧")
+
+    H, W = dm0.shape
+    Kd = load_intrinsics_dataset_aware(W, H, SEQ_DIR)
+    K = np.array([[Kd["fx"], 0, Kd["cx"]],
+                  [0, Kd["fy"], Kd["cy"]],
+                  [0, 0, 1]], np.float64)
+    intr = o3d.camera.PinholeCameraIntrinsic(W, H, Kd["fx"], Kd["fy"], Kd["cx"], Kd["cy"])
+    print(f"[K] fx={Kd['fx']:.1f} fy={Kd['fy']:.1f} cx={Kd['cx']:.1f} cy={Kd['cy']:.1f}")
+
+    # ---------- Align GT so first GT pose becomes Identity ----------
+    GT_TIME_SHIFT = 0.0
+    S_align = np.eye(4, dtype=np.float64)
+    if USE_GT:
+        t0 = _try_float_stem(colors[start])
+        if t0 is None:
+            print("[gt] cannot parse start timestamp (GT disabled)")
+            USE_GT = False
+        else:
+            ts_gt, _ = gt_data
+            j0 = int(np.argmin(np.abs(ts_gt - t0)))
+            GT_TIME_SHIFT = float(ts_gt[j0] - t0)
+            print(f"[gt] time shift estimated: {GT_TIME_SHIFT:.6f}s")
+            T_gt0 = query_gt_nearest(gt_data, t0 + GT_TIME_SHIFT, max_dt=max(GT_MAX_DT, 0.5))
+            if T_gt0 is None:
+                print("[gt] cannot get initial GT pose (GT disabled)")
+                USE_GT = False
+            else:
+                S_align = np.linalg.inv(T_gt0)
+                print("[gt] enabled, aligned so first GT pose is Identity")
+
+    # ---------- TSDF ----------
+    tsdf = TSDFWrapper(VOXEL_LEN, VOXEL_LEN * SDF_TRUNC_K, coarse_factor=3.0,
+                       fuse_mode="holefill", fuse_voxel=VOXEL_LEN * 1.2, hole_dist=VOXEL_LEN * 3.0 * 0.9)
+
+    # ---------- UI: OpenCV RGB ----------
+    cv2.namedWindow("Left RGB", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Left RGB", 640, 480)
+    cv2.imshow("Left RGB", cv2.cvtColor(color0_rgb, cv2.COLOR_RGB2BGR))
+
+    # ---------- UI: Open3D live preview (single window) ----------
+    vis = None
+    pcd_show = None
+    traj_odo = None
+    traj_fused = None
+    vis_state = {"view_inited": False}
+
+    if LIVE_VIS:
+        o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="GT+ICP TSDF (Live Preview)", width=1100, height=800, visible=True)
+
+        # coordinate frame
+        coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
+        vis.add_geometry(coord)
+
+        # preview point cloud
+        pcd_show = o3d.geometry.PointCloud()
+        vis.add_geometry(pcd_show)
+
+        # two trajectories: odometry-only vs fused
+        traj_odo = o3d.geometry.LineSet()
+        traj_fused = o3d.geometry.LineSet()
+        vis.add_geometry(traj_odo)
+        vis.add_geometry(traj_fused)
+
+        opt = vis.get_render_option()
+        opt.background_color = np.array([0, 0, 0])
+        opt.point_size = float(LIVE_VIS_POINT_SIZE)
+
+    def _vis_poll() -> bool:
+        """Keep the Open3D window responsive. Return False if window is closed."""
+        if (not LIVE_VIS) or (vis is None):
+            return True
+        alive = vis.poll_events()
+        vis.update_renderer()
+        return bool(alive)
+
+    def _update_lineset(ls: o3d.geometry.LineSet, pts_np: np.ndarray, color_rgb=(0.0, 1.0, 0.0)):
+        """Update a LineSet in-place from a Nx3 numpy array."""
+        if ls is None:
+            return
+        if pts_np.shape[0] < 2:
+            ls.points = o3d.utility.Vector3dVector(pts_np)
+            ls.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+            ls.colors = o3d.utility.Vector3dVector(np.zeros((0, 3), dtype=np.float64))
+            return
+        lines = np.stack([np.arange(pts_np.shape[0] - 1), np.arange(1, pts_np.shape[0])], axis=1).astype(np.int32)
+        cols = np.tile(np.array(color_rgb, dtype=np.float64)[None, :], (lines.shape[0], 1))
+        ls.points = o3d.utility.Vector3dVector(pts_np.astype(np.float64))
+        ls.lines = o3d.utility.Vector2iVector(lines)
+        ls.colors = o3d.utility.Vector3dVector(cols)
+
+    def _vis_update_from_tsdf(tsdf_obj, pts_odo=None, pts_fused=None):
+        """Extract a light preview and update geometries."""
+        if (not LIVE_VIS) or (vis is None) or (pcd_show is None):
+            return
+        try:
+            p = tsdf_obj.extract_point_cloud(mode=LIVE_VIS_MODE, weight_thr=VBG_PREVIEW_WEIGHT_THR)
+            if len(p.points) == 0:
+                return
+            if LIVE_VIS_VOXEL_DS and LIVE_VIS_VOXEL_DS > 0:
+                p = p.voxel_down_sample(LIVE_VIS_VOXEL_DS)
+
+            # update point cloud in-place
+            pcd_show.points = p.points
+            pcd_show.colors = p.colors
+            vis.update_geometry(pcd_show)
+
+            if pts_odo is not None:
+                _update_lineset(traj_odo, pts_odo, color_rgb=(1.0, 0.2, 0.2))  # red-ish
+                vis.update_geometry(traj_odo)
+            if pts_fused is not None:
+                _update_lineset(traj_fused, pts_fused, color_rgb=(0.2, 1.0, 0.2))  # green-ish
+                vis.update_geometry(traj_fused)
+
+            if (not vis_state["view_inited"]) and len(pcd_show.points) > 0:
+                vis.reset_view_point(True)
+                vis_state["view_inited"] = True
+
+        except Exception as e:
+            print("[vis] update failed:", repr(e))
+
+    # ---------- Poses ----------
+    # T_cw: fused pose used for integration
+    # T_cw_odo: pure odometry chain pose (for comparison / trajectory display)
+    T_cw = np.eye(4, dtype=np.float64)
+    T_cw_odo = np.eye(4, dtype=np.float64)
+
+    # integrate the first frame immediately (so you can SEE modeling starts)
+    T_int0 = T_cw if ENABLE_GT_FUSION else T_cw_odo
+    tsdf.integrate(color0_rgb, dm0, K, intr, T_int0, depth_max=far0)
+    processed = 1
+    print("[integrate] started (first frame integrated)")
+
+    # trajectories (camera centers)
+    traj_pts_odo = [T_cw_odo[:3, 3].copy()]
+    traj_pts_fused = [T_cw[:3, 3].copy()] if ENABLE_GT_FUSION else []
+    _vis_update_from_tsdf(tsdf, np.asarray(traj_pts_odo),
+                          np.asarray(traj_pts_fused) if ENABLE_GT_FUSION else None)
+    _vis_poll()
+
+    # ---------- Prefetch frames ----------
+    loader = FrameLoader(colors[start + 1:], depths[start + 1:])
+    loader.start()
+
+    trk_color, trk_dm, trk_far = color0_rgb, dm0, far0
+    accepted_kf = 0
+
+    try:
+        k = start + 1  # global frame index
+        while k < total:
+            # keep UI responsive
+            if not _vis_poll():
+                break
+
+            try:
+                item = loader.q.get(timeout=0.5)
+            except queue.Empty:
+                cv2.waitKey(1)
+                if not loader.is_alive():
+                    break
+                continue
+
+            if item[0] == "__ERR__":
+                print("[loader-error]", item[1])
+                break
+
+            name_c, name_d, color_rgb, dm, near_auto, far_auto = item
+            cv2.imshow("Left RGB", cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR))
+
+            # keyframe policy
+            if (k % KEYFRAME_STEP) == 0:
+                rgbd_prev = build_o3d_rgbd(trk_color, trk_dm, depth_trunc=trk_far)
+                rgbd_cur  = build_o3d_rgbd(color_rgb, dm, depth_trunc=far_auto)
+
+                pc_prev = make_pcd_from_rgbd_o3d(rgbd_prev, intr, voxel=0.014)
+                pc_cur  = make_pcd_from_rgbd_o3d(rgbd_cur,  intr, voxel=0.014)
+
+                if len(pc_prev.points) < MIN_PTS_FOR_ICP or len(pc_cur.points) < MIN_PTS_FOR_ICP:
+                    k += 1
+                    cv2.waitKey(1)
+                    continue
+
+                pts_prev = np.asarray(pc_prev.points)
+                pts_cur  = np.asarray(pc_cur.points)
+
+                # init candidates
+                init_candidates = [("I", np.eye(4, dtype=np.float64))]
+                T_pnp = orb_pnp_init_cuda(trk_color, trk_dm, color_rgb, K)
+                if (T_pnp is not None) and reasonable(T_pnp, 0.30, 20.0):
+                    init_candidates.append(("pnp", T_pnp))
+
+                def score_init(T):
+                    return fast_overlap_xform(pts_prev, pts_cur, T, grid=0.03, sample_n=1500)
+
+                best_name, initT = max(init_candidates, key=lambda kv: score_init(kv[1]))
+
+                reg = colored_icp_multiscale(pc_prev, pc_cur, init=initT) if reasonable(initT, 0.30, 20.0) else None
+                if reg is None:
+                    reg = icp_point2plane_multiscale_robust(pc_prev, pc_cur, init=initT)
+                if reg is None:
+                    k += 1
+                    cv2.waitKey(1)
+                    continue
+
+                Tij = reg.transformation
+                fit = float(getattr(reg, "fitness", 0.0))
+                rmse = float(getattr(reg, "inlier_rmse", 999.0))
+                ok = (fit >= ICP_MIN_FIT_ODO) and (rmse <= ICP_MAX_RMSE_ODO) and reasonable(Tij, ODOM_MAX_T, ODOM_MAX_R_DEG)
+                if not ok:
+                    k += 1
+                    cv2.waitKey(1)
+                    continue
+
+                ov_after = fast_overlap_xform(pts_prev, pts_cur, Tij, grid=0.03, sample_n=1500)
+                if ov_after < TRACK_OV_MIN:
+                    k += 1
+                    cv2.waitKey(1)
+                    continue
+
+                # accept tracking: update both odometry-only and fused poses
+                T_cw_odo = T_cw_odo @ np.linalg.inv(Tij)
+                T_cw     = T_cw     @ np.linalg.inv(Tij)
+                accepted_kf += 1
+
+                trk_color, trk_dm, trk_far = color_rgb, dm, far_auto
+
+                # optional GT fusion (external prior)
+                if ENABLE_GT_FUSION and USE_GT and (accepted_kf % GT_STRIDE == 0):
+                    t_img = _try_float_stem(Path(name_c))
+                    if t_img is not None:
+                        T_gt = query_gt_nearest(gt_data, t_img + GT_TIME_SHIFT, max_dt=GT_MAX_DT)
+                        if T_gt is not None:
+                            T_gt_aligned = S_align @ T_gt
+                            T_cw, fused, err_r, err_t = gt_fuse_pose(T_cw, T_gt_aligned)
+                            if fused:
+                                print(f"[gt-fuse] k={k:04d} err_r={np.degrees(err_r):.3f}deg err_t={err_t:.4f}m  (alpha={FUSE_ALPHA})")
+
+                # integrate (THIS is the moment modeling happens)
+                if ov_after >= INTEGRATE_OV_MIN:
+                    T_int = T_cw if ENABLE_GT_FUSION else T_cw_odo
+                    tsdf.integrate(color_rgb, dm, K, intr, T_int, depth_max=far_auto)
+                    processed += 1
+
+                    # trajectories
+                    traj_pts_odo.append(T_cw_odo[:3, 3].copy())
+
+                    if ENABLE_GT_FUSION:
+                        traj_pts_fused.append(T_cw[:3, 3].copy())
+                        pts_fused = np.asarray(traj_pts_fused)
+                    else:
+                        pts_fused = None
+
+                    if LIVE_VIS and (processed % LIVE_UPDATE_EVERY_INT) == 0:
+                        _vis_update_from_tsdf(tsdf, np.asarray(traj_pts_odo), pts_fused)
+
+            # keyboard / exit
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+
+            k += 1
+
+        # ---------- Save final point cloud ----------
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        pcd_path = OUT_DIR / f"pcd_final_{ts}.ply"
+        pc_final = tsdf.extract_point_cloud(mode="holefill", weight_thr=VBG_FINAL_WEIGHT_THR)
+        o3d.io.write_point_cloud(str(pcd_path), pc_final)
+        print(f"[final] saved: {pcd_path}")
+
+        # show final model until user closes window
+        if LIVE_VIS:
+            print("[vis] showing final model (close Open3D window to exit)")
+            _vis_update_from_tsdf(tsdf, np.asarray(traj_pts_odo), np.asarray(traj_pts_fused))
+            while True:
+                if not _vis_poll():
+                    break
+                cv2.waitKey(1)
+
+    except Exception:
+        logp = OUT_DIR / "live_crash.log"
+        with open(logp, "a", encoding="utf-8") as f:
+            f.write("".join(traceback.format_exc()) + "\n")
+        print(f"[fatal] 运行异常，详见日志 {logp}")
+
+    finally:
+        # Close UI windows first (important on Windows).
+        try:
+            if vis is not None:
+                vis.destroy_window()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+        # Explicitly free Open3D CUDA resources before interpreter shutdown.
+        try:
+            import gc as _gc
+            try:
+                del pcd_show
+            except Exception:
+                pass
+            try:
+                del tsdf
+            except Exception:
+                pass
+            try:
+                del vis
+            except Exception:
+                pass
+            try:
+                _gc.collect()
+            except Exception:
+                pass
+
+            if HAS_O3D_CUDA and hasattr(o3d, "core") and hasattr(o3d.core, "cuda"):
+                try:
+                    if hasattr(o3d.core.cuda, "synchronize"):
+                        o3d.core.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(o3d.core.cuda, "release_cache"):
+                        o3d.core.cuda.release_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()

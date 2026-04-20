@@ -1,0 +1,8 @@
+node_modules/ 
+Datasets/
+Code Backup/
+High-Low Frequency Pose Fusion/Outputs/
+RAFT-Stereo/models/
+RAFT-Stereo/datasets/
+depth_checkpoints/
+*.obj

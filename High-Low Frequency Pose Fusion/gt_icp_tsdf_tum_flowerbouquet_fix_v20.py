@@ -1,0 +1,2484 @@
+# -*- coding: utf-8 -*-
+"""
+GT + ICP (external prior fusion) TSDF reconstruction for TUM RGB-D sequences.
+
+Fixes vs your current script (the ones that most commonly cause "根本没在建模"):
+1) CUDA runtime probe + automatic fallback to CPU TSDF if Open3D CUDA is "available" but driver/runtime fails.
+2) ROI is used for tracking only (optional). TSDF integration uses FULL depth by default, so you don't zero-out
+   almost everything and end up integrating nothing but a sparse background patch.
+3) Integration gating relaxed: integrate whenever tracking is accepted (no extra overlap gate that can starve TSDF).
+4) Adds skip counters + periodic logs so you can see *why* frames are not integrated.
+5) Keeps your overall pipeline structure: auto depth windowing, ORB+PnP init, colored ICP + robust P2Plane ICP,
+   GT fusion with clamped SE(3) correction, and live Open3D preview.
+"""
+
+import time
+from pathlib import Path
+import threading
+import queue
+import numpy as np
+import cv2
+import traceback
+import open3d as o3d
+import contextlib
+import io
+import math
+
+# ==========================
+# Config (edit here)
+# ==========================
+SEQ_DIR = Path(r"D:\Projects\Underwater\Datasets\TUM_RGBD\rgbd_dataset_freiburg2_metallic_sphere2")
+OUT_DIR = Path(r"D:\Projects\Underwater\Outputs\TUM_RGBD\rgbd_dataset_freiburg2_metallic_sphere2")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+SNAPSHOT_DIR = OUT_DIR / "snapshots"
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Visual / runtime
+KEYFRAME_STEP     = 1
+SHOW_MESH         = False
+
+LIVE_VIS = True
+LIVE_UPDATE_EVERY_INT = 10           # update Open3D window every N integrations
+LIVE_VIS_MODE = "fine"             # 'coarse' | 'fine' | 'merge' | 'holefill'
+LIVE_VIS_VOXEL_DS = 0.006            # downsample for visualization (smaller -> vase/details visible; set 0 to disable)
+LIVE_VIS_POINT_SIZE = 2.0
+VBG_PREVIEW_WEIGHT_THR = 0.0         # GPU TSDF only; 0.0 shows earliest results
+VBG_FINAL_WEIGHT_THR   = 0.0     # keep low-weight voxels too (thin objects otherwise vanish)
+
+# Depth filtering
+NEAR_CLIP      = 0.20
+DEPTH_TRUNC    = 3.50               # max depth (meters). For object-only, keep small (1.5~2.5).
+USE_CENTER_ROI = False               # center ellipse ROI (tracking only if TRACK_USE_ROI=True)
+ROI_SCALE      = 0.45
+
+# ROI policy
+USE_INTERACTIVE_ROI_ONCE = True      # select ROI once at bootstrap
+TRACK_USE_ROI = True                # ROI affects tracking depth (ICP)
+INTEGRATE_USE_ROI = True            # integrate only inside ROI (foreground modeling)
+
+# Foreground depth selection inside ROI
+# - Tracking wants stability -> median depth inside ROI (often table+object)
+# - Integration wants to keep vase/flowers -> use a quantile band to include both
+TRACK_ROI_DEPTH_WINDOW = True
+TRACK_ROI_DEPTH_POLICY = "nearest"    # "median" | "nearest" | "band"
+TRACK_ROI_DEPTH_Q      = 0.05         # used when policy="nearest"
+TRACK_ROI_DEPTH_MARGIN = 0.03         # meters
+TRACK_ROI_DEPTH_HALFWIN = 0.60        # meters (used for median/nearest)
+
+INTEGRATE_ROI_DEPTH_WINDOW = False
+INTEGRATE_ROI_DEPTH_POLICY = "band"   # "median" | "nearest" | "band"
+INTEGRATE_ROI_DEPTH_Q      = 0.15      # used when policy="nearest"
+INTEGRATE_ROI_DEPTH_MARGIN = 0.03      # meters
+INTEGRATE_ROI_DEPTH_HALFWIN = 0.28     # meters (used for median/nearest)
+# band params: keep depths in [q_lo, q_hi] with padding; tuned for flowerbouquet (table near, vase mid, wall far)
+INTEGRATE_BAND_Q_LO = 0.05
+INTEGRATE_BAND_Q_HI = 0.85
+INTEGRATE_BAND_PAD  = 0.05            # meters
+# Extra robustness for flowerbouquet: remove the nearest depth tail (usually the table)
+INTEGRATE_BAND_TRIM_NEAR_Q = 0.22      # discard depths below this quantile when estimating band (0 disables)
+INTEGRATE_BAND_EXCLUDE_BOTTOM_FRAC = 0.25  # exclude ROI bottom frac when estimating band (0 disables)
+INTEGRATE_BAND_KMEANS2 = True        # split (vase) vs (wall) modes in z with 1D kmeans (recommended)
+INTEGRATE_BAND_KMEANS_ITERS = 12
+
+# Depth hole filling (helps TUM flowerbouquet: leaves/stems often have invalid depth)
+ROI_DEPTH_INPAINT = True
+
+# --- Foreground depth lock (optional; only applied for integration window) ---
+# Problem this solves (flowerbouquet_brownbackground): later frames have many invalid depths on vase/flowers.
+# If your ROI depth band is recomputed every frame, the band drifts to "easy" background (wall/table) and TSDF
+# keeps integrating that -> the vase gets carved/washed out ("后期被抹平").
+FG_DEPTH_LOCK = False
+FG_Z_REF = None          # used for 'nearest'/'median' policies
+
+# Band lock for policy='band' (THIS is what you want for flowerbouquet)
+FG_BAND_LO = None
+FG_BAND_HI = None
+FG_LOCK_CENTER_FRAC = 0.60   # compute initial band from the ROI center crop (biases toward vase, away from ROI edges/background)
+INTEGRATE_MIN_KEEP_PX   = 10   # if kept pixels inside ROI band < this, treat the frame as "foreground missing" and do NOT integrate
+INTEGRATE_MIN_KEEP_FRAC = 0.0   # and/or use fraction of ROI area (0 disables if set to 0)
+
+# --- Dominant-plane suppression inside ROI (table/wall) ---
+INTEGRATE_REMOVE_DOMINANT_PLANES = True
+PLANE_REMOVE_N = 3
+PLANE_RANSAC_DIST = 0.035
+PLANE_RANSAC_ITERS = 80
+PLANE_MIN_INLIER_RATIO = 0.08
+PLANE_SUBSAMPLE = 20000
+PLANE_BIAS_BOTTOM_FRAC = 0.65      # fit 1st plane mainly from ROI bottom region (targets table)
+PLANE_FIT_CENTER_FRAC = 0.70      # also bias plane fit to ROI center crop
+
+
+
+PLANE_MIN_INLIER_PTS = 600          # remove plane if inliers >= this (even if ratio small)
+
+# Foreground cluster filter (after plane removal, keep nearest DBSCAN cluster)
+FG_CLUSTER_FILTER = False   # NOTE: keep-nearest cluster often keeps the table; disable by default
+CLUSTER_EPS = 0.03                   # meters
+CLUSTER_MIN_POINTS = 25
+CLUSTER_KEEP_MODE = "nearest"         # 'nearest' or 'largest'
+# --- TSDF integration pose source (fixes small-object washout when fused pose drifts) ---
+#   "gt"    : integrate with ground-truth pose (recommended for TUM)
+#   "fused" : integrate with GT-corrected estimate (default pipeline)
+#   "icp"   : integrate with pure ICP estimate
+TSDF_POSE_SOURCE = "gt"
+
+# --- Occlusion-aware integration (prevents foreground from being overwritten by far background) ---
+# Idea: build a sparse "foreground reference" point cloud from the early part of the sequence (when vase exists),
+# then for each later frame, project that reference into the current camera to form a Z-buffer.
+# Any depth samples that are significantly farther than the reference along the same pixel ray are treated as occluded
+# (i.e., likely background behind the vase) and are NOT integrated into TSDF.
+OCCLUSION_GATING = False
+OCCLUSION_REF_INIT_FRAMES = 140        # how many *successful integrations* to collect reference points from
+OCCLUSION_REF_MAX_PTS = 180000         # cap reference points after voxel-downsample
+OCCLUSION_REF_VOXEL = 0.006            # voxel size for reference downsample (meters)
+OCCLUSION_TOL = 0.045                  # meters; reject depth if depth > z_ref + tol
+OCCLUSION_MIN_HITS = 2500              # minimum projected ref pixels in ROI to enable gating
+OCCLUSION_REF_CENTER_FRAC = 0.78       # only collect ref points from ROI center crop (reduces table/wall influence)
+OCCLUSION_REF_EXCLUDE_BOTTOM_FRAC = 0.15  # exclude bottom fraction of ROI when collecting ref points (reduces table)
+OCCLUSION_DEBUG = False
+# --- Mid-run snapshots (export reference models) ---
+SAVE_SNAPSHOTS = True
+SNAPSHOT_EVERY = 250
+SNAPSHOT_MODE = "fine"
+SNAPSHOT_WEIGHT_THR = 0.0
+SNAPSHOT_VOXEL_DS = 0.006        # downsample for SNAPSHOT exports; set 0 to disable (recommended <= LIVE_VIS_VOXEL_DS)
+SNAPSHOT_AT = [250, 500]         # if not None, export exactly at these processed counts (overrides SNAPSHOT_EVERY)
+STOP_AFTER_INTEGRATIONS = None   # e.g. 550: stop after this many successful integrations (will still export final)
+SNAPSHOT_ON_KEY = True
+FINAL_EXPORT_MODE = "fine"
+FINAL_EXPORT_WEIGHT_THR = 0.0
+
+ROI_INPAINT_RADIUS = 5         # 2~5
+
+
+# ICP / odometry gating (make these permissive first; tighten later)
+MIN_PTS_FOR_ICP   = 600
+ICP_MIN_FIT_ODO   = 0.25
+ICP_MAX_RMSE_ODO  = 0.030
+ODOM_MAX_T        = 0.20
+ODOM_MAX_R_DEG    = 20
+
+# TSDF params
+VOXEL_LEN   = 0.008
+SDF_TRUNC_K = 2.0
+
+# GPU TSDF memory controls (VoxelBlockGrid)
+TSDF_GPU_BLOCK_RES          = 8
+TSDF_GPU_BLOCK_COUNT_FINE   = 20000
+TSDF_GPU_BLOCK_COUNT_COARSE = 8000
+TSDF_GPU_ENABLE_COARSE = False
+TSDF_GPU_OOM_RETRY          = True
+
+# Auto depth windowing (used for per-frame clip; integration uses max(DEPTH_TRUNC, auto_far))
+AUTO_DEPTH       = True
+AUTO_Q_LOW       = 0.02
+AUTO_Q_HIGH      = 0.75
+AUTO_MARGIN_NEAR = 0.04
+AUTO_MARGIN_FAR  = 0.05
+AUTO_SMOOTH      = 0.3
+AUTO_BG_OTSU     = False
+
+# GT + ICP fusion
+FUSE_ALPHA        = 0.25
+FUSE_MAX_R_DEG    = 2.0
+FUSE_MAX_T        = 0.03
+FUSE_REJECT_R_DEG = 180.0
+FUSE_REJECT_T     = 10.0
+GT_STRIDE         = 1
+GT_MAX_DT         = 0.05
+
+# --------------------------
+# Helpers
+# --------------------------
+class _SilentStderr:
+    def __enter__(self):
+        self._buf = io.StringIO()
+        self._cm = contextlib.redirect_stderr(self._buf)
+        self._cm.__enter__()
+        return self._buf
+    def __exit__(self, exc_type, exc, tb):
+        self._cm.__exit__(exc_type, exc, tb)
+
+def clamp_twist(xi, max_r_rad: float, max_t: float):
+    xi = np.asarray(xi, dtype=np.float64).copy()
+    w = xi[:3]; v = xi[3:]
+    nw = float(np.linalg.norm(w))
+    if nw > max_r_rad:
+        xi[:3] = w * (max_r_rad / max(1e-12, nw))
+    nv = float(np.linalg.norm(v))
+    if nv > max_t:
+        xi[3:] = v * (max_t / max(1e-12, nv))
+    return xi
+
+def skew(w):
+    wx, wy, wz = w
+    return np.array([[0, -wz, wy],
+                     [wz, 0, -wx],
+                     [-wy, wx, 0]], dtype=np.float64)
+
+def so3_log(R):
+    tr = np.trace(R)
+    cos_theta = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    theta = math.acos(cos_theta)
+    if theta < 1e-8:
+        return 0.5 * np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]], dtype=np.float64)
+    w_hat = (theta / (2.0 * math.sin(theta))) * np.array(
+        [R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]], dtype=np.float64
+    )
+    return w_hat
+
+def so3_exp(w):
+    theta = float(np.linalg.norm(w))
+    K = skew(w)
+    I = np.eye(3, dtype=np.float64)
+    if theta < 1e-8:
+        return I + K
+    A = math.sin(theta) / theta
+    B = (1.0 - math.cos(theta)) / (theta * theta)
+    return I + A * K + B * (K @ K)
+
+def se3_exp(xi):
+    w = np.asarray(xi[:3], dtype=np.float64)
+    v = np.asarray(xi[3:], dtype=np.float64)
+    theta = float(np.linalg.norm(w))
+    R = so3_exp(w)
+    I = np.eye(3, dtype=np.float64)
+    K = skew(w)
+
+    if theta < 1e-8:
+        V = I + 0.5 * K
+    else:
+        A = (1.0 - math.cos(theta)) / (theta * theta)
+        B = (theta - math.sin(theta)) / (theta * theta * theta)
+        V = I + A * K + B * (K @ K)
+
+    t = V @ v
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R
+    T[:3, 3] = t
+    return T
+
+def se3_log(T):
+    R = T[:3,:3]
+    t = T[:3, 3]
+    w = so3_log(R)
+    theta = float(np.linalg.norm(w))
+    I = np.eye(3, dtype=np.float64)
+    K = skew(w)
+
+    if theta < 1e-8:
+        V_inv = I - 0.5 * K
+    else:
+        A = 1.0/(theta*theta)
+        B = (1.0 + math.cos(theta)) / (2.0 * theta * math.sin(theta))
+        V_inv = I - 0.5 * K + (A - B) * (K @ K)
+
+    v = V_inv @ t
+    xi = np.zeros(6, dtype=np.float64)
+    xi[:3] = w
+    xi[3:] = v
+    return xi
+
+def quat_to_R(qx, qy, qz, qw):
+    x, y, z, w = float(qx), float(qy), float(qz), float(qw)
+    n = x*x + y*y + z*z + w*w
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    xx, yy, zz = x*x*s, y*y*s, z*z*s
+    xy, xz, yz = x*y*s, x*z*s, y*z*s
+    wx, wy, wz = w*x*s, w*y*s, w*z*s
+    R = np.array([
+        [1.0 - (yy + zz),       xy - wz,         xz + wy],
+        [      xy + wz,   1.0 - (xx + zz),       yz - wx],
+        [      xz - wy,         yz + wx,   1.0 - (xx + yy)]
+    ], dtype=np.float64)
+    return R
+
+def load_tum_groundtruth(gt_path: Path):
+    if not gt_path.exists():
+        print(f"[gt] not found: {gt_path} (GT fusion disabled)")
+        return None
+    ts = []
+    T_list = []
+    with open(gt_path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if (not ln) or ln.startswith("#"):
+                continue
+            parts = ln.split()
+            if len(parts) < 8:
+                continue
+            t = float(parts[0])
+            tx, ty, tz = map(float, parts[1:4])
+            qx, qy, qz, qw = map(float, parts[4:8])
+            R = quat_to_R(qx, qy, qz, qw)
+            T = np.eye(4, dtype=np.float64)
+            T[:3,:3] = R
+            T[:3, 3] = np.array([tx, ty, tz], dtype=np.float64)
+            ts.append(t)
+            T_list.append(T)
+    if len(ts) < 2:
+        print("[gt] too few samples (GT fusion disabled)")
+        return None
+    return np.asarray(ts, dtype=np.float64), T_list
+
+def query_gt_nearest(gt_data, t_query: float, max_dt: float = 0.02):
+    if gt_data is None:
+        return None
+    ts, T_list = gt_data
+    j = int(np.argmin(np.abs(ts - t_query)))
+    if abs(ts[j] - t_query) > max_dt:
+        return None
+    return T_list[j]
+
+def query_gt_interp(gt_data, t_query: float):
+    """Continuous SE(3) interpolation of GT pose.
+
+    Uses Lie algebra interpolation: T(t)=T0*Exp(alpha*Log(T0^{-1}T1)).
+    Always returns a pose within the GT time span (clamped to endpoints).
+    """
+    if gt_data is None:
+        return None
+    ts, T_list = gt_data
+    if t_query <= ts[0]:
+        return T_list[0]
+    if t_query >= ts[-1]:
+        return T_list[-1]
+    import numpy as _np
+    i = int(_np.searchsorted(ts, t_query))
+    if i <= 0:
+        return T_list[0]
+    if i >= len(ts):
+        return T_list[-1]
+    t0 = float(ts[i-1]); t1 = float(ts[i])
+    if t1 <= t0 + 1e-12:
+        return T_list[i]
+    a = (t_query - t0) / (t1 - t0)
+    a = float(_np.clip(a, 0.0, 1.0))
+    T0 = T_list[i-1]
+    T1 = T_list[i]
+    T_rel = _np.linalg.inv(T0) @ T1
+    xi = se3_log(T_rel)
+    T = T0 @ se3_exp(a * xi)
+    return T
+
+
+def _try_float_stem(p: Path):
+    try:
+        return float(p.stem)
+    except Exception:
+        return None
+
+def depth_to_meters(depth_raw: np.ndarray):
+    d = depth_raw.astype(np.float32)
+    if d.size == 0:
+        return d
+    if depth_raw.dtype == np.uint16:
+        return d / 5000.0
+    return d
+
+def cut_background_otsu(dm: np.ndarray):
+    z = dm[(dm > 0) & np.isfinite(dm)]
+    if z.size < 1000:
+        return dm
+    lo = float(np.quantile(z, 0.02)); hi = float(np.quantile(z, 0.98))
+    if hi <= lo + 1e-6:
+        return dm
+    s = np.clip((dm - lo) / (hi - lo), 0.0, 1.0)
+    s8 = (s * 255).astype(np.uint8)
+    _, thr = cv2.threshold(s8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    keep = s8 <= thr
+    if keep.sum() < 0.25 * s8.size:
+        keep = ~keep
+    dm2 = dm.copy()
+    dm2[~keep] = 0.0
+    return dm2
+
+# ==========================
+# CUDA availability (robust)
+# ==========================
+def probe_o3d_cuda_runtime() -> bool:
+    """Open3D may report cuda.is_available()==True but still fail at runtime (driver mismatch).
+    This probe catches that and forces CPU fallback.
+    """
+    try:
+        if not (hasattr(o3d, "core") and hasattr(o3d.core, "cuda") and o3d.core.cuda.is_available()):
+            return False
+        dev = o3d.core.Device("CUDA:0")
+        a = o3d.core.Tensor(np.ones((64, 64), np.float32), device=dev)
+        b = a @ a
+        _ = float(b.sum().cpu().item())
+        # optional sync
+        try:
+            if hasattr(o3d.core.cuda, "synchronize"):
+                o3d.core.cuda.synchronize()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[env] Open3D CUDA probe failed -> force CPU. err={repr(e)}")
+        return False
+
+HAS_O3D_CUDA = probe_o3d_cuda_runtime()
+print(f"[env] Open3D CUDA usable = {HAS_O3D_CUDA}")
+
+HAS_CV_CUDA = (hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+print(f"[env] OpenCV CUDA = {HAS_CV_CUDA}, devices = {cv2.cuda.getCudaEnabledDeviceCount() if HAS_CV_CUDA else 0}")
+
+# ==========================
+# CUDA preproc (ORB etc.)
+# ==========================
+class CudaPreproc:
+    def __init__(self):
+        self.use_cuda = HAS_CV_CUDA
+        if self.use_cuda:
+            try:
+                self.stream = cv2.cuda.Stream()
+                self.orb = cv2.cuda_ORB.create(nfeatures=5000, fastThreshold=7, scaleFactor=1.2, nlevels=8)
+                self.bf = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_HAMMING)
+            except Exception:
+                self.use_cuda = False
+
+    def to_gpu(self, img):
+        g = cv2.cuda_GpuMat()
+        g.upload(img)
+        return g
+
+    def bilateral(self, img32f, d=5, sigmaColor=0.05, sigmaSpace=3):
+        if not self.use_cuda:
+            return cv2.bilateralFilter(img32f, d=d, sigmaColor=sigmaColor, sigmaSpace=sigmaSpace)
+        g = self.to_gpu(img32f)
+        out = cv2.cuda.bilateralFilter(g, -1, sigmaColor, sigmaSpace)
+        return out.download()
+
+    def bgr2rgb(self, img):
+        if not self.use_cuda:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        g = self.to_gpu(img)
+        out = cv2.cuda.cvtColor(g, cv2.COLOR_BGR2RGB)
+        return out.download()
+
+    def orb_match(self, img0_rgb, img1_rgb, max_pts=2500):
+        img0 = cv2.cvtColor(img0_rgb, cv2.COLOR_RGB2BGR)
+        img1 = cv2.cvtColor(img1_rgb, cv2.COLOR_RGB2BGR)
+        if self.use_cuda:
+            g0 = self.to_gpu(img0); g1 = self.to_gpu(img1)
+            kps0, des0 = self.orb.detectAndComputeAsync(g0, None, stream=self.stream)
+            kps1, des1 = self.orb.detectAndComputeAsync(g1, None, stream=self.stream)
+            if des0 is None or des1 is None:
+                return [], None, None
+            matches = self.bf.match(des0, des1)
+            matches = sorted(matches, key=lambda x: x.distance)[:max_pts]
+            kps0 = self.orb.convert(g0, kps0)
+            kps1 = self.orb.convert(g1, kps1)
+            return matches, kps0, kps1
+        else:
+            orb = cv2.ORB_create(nfeatures=5000, fastThreshold=7, scaleFactor=1.2, nlevels=8)
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            kps0, des0 = orb.detectAndCompute(img0, None)
+            kps1, des1 = orb.detectAndCompute(img1, None)
+            if des0 is None or des1 is None:
+                return [], None, None
+            matches = bf.match(des0, des1)
+            matches = sorted(matches, key=lambda x: x.distance)[:max_pts]
+            return matches, kps0, kps1
+
+GP = CudaPreproc()
+
+# ==========================
+# IO helpers
+# ==========================
+def list_rgbd_paths(seq_dir: Path):
+    for name in ["associations.txt", "associate.txt", "associations.txt"]:
+        f = seq_dir / name
+        if f.exists():
+            pairs = []
+            with open(f, "r", encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    parts = ln.split()
+                    if len(parts) >= 4:
+                        _, rgb_rel, _, d_rel = parts[:4]
+                        pairs.append((seq_dir / rgb_rel, seq_dir / d_rel))
+            if not pairs:
+                raise FileNotFoundError(f"{name} 为空")
+            print(f"[io] use {name}, pairs={len(pairs)}")
+            return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    rgb_dir, dep_dir = seq_dir / "rgb", seq_dir / "depth"
+    rgbs = sorted(list(rgb_dir.glob("*.png")) + list(rgb_dir.glob("*.jpg")))
+    deps = sorted(list(dep_dir.glob("*.png")))
+    if not rgbs or not deps:
+        raise FileNotFoundError("未找到 rgb/*.png(jpg) 或 depth/*.png")
+
+    rgb_ts = [(p, _try_float_stem(p)) for p in rgbs]
+    dep_ts = [(p, _try_float_stem(p)) for p in deps]
+    rgb_ts = [(p, t) for p, t in rgb_ts if t is not None]
+    dep_ts = [(p, t) for p, t in dep_ts if t is not None]
+    if not rgb_ts or not dep_ts:
+        raise RuntimeError("文件名不是时间戳，且没有 associations.txt")
+
+    dep_times = np.array([t for _, t in dep_ts], dtype=np.float64)
+    pairs = []
+    for p_rgb, t in rgb_ts:
+        j = int(np.argmin(np.abs(dep_times - t)))
+        if abs(dep_times[j] - t) <= 0.050:
+            pairs.append((p_rgb, dep_ts[j][0]))
+    if not pairs:
+        raise RuntimeError("时间最近配对失败（阈值太严格？）")
+    print(f"[io] timestamp-nearest pairing: pairs={len(pairs)} (rgb={len(rgbs)}, depth={len(deps)})")
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+def load_intrinsics_dataset_aware(w: int, h: int, seq_root: Path):
+    root_str = str(seq_root).lower()
+    tag = "fallback"
+    if ("freiburg1" in root_str) or ("rgbd_dataset_freiburg1" in root_str) or ("fr1" in root_str):
+        fx, fy, cx, cy = 517.3, 516.5, 318.6, 255.3
+        tag = "fr1"
+    elif ("freiburg2" in root_str) or ("rgbd_dataset_freiburg2" in root_str) or ("fr2" in root_str):
+        fx, fy, cx, cy = 520.9, 521.0, 325.1, 249.7
+        tag = "fr2"
+    elif ("freiburg3" in root_str) or ("rgbd_dataset_freiburg3" in root_str) or ("fr3" in root_str):
+        fx, fy, cx, cy = 535.4, 539.2, 320.1, 247.6
+        tag = "fr3"
+    else:
+        fx = 525.0 * (w / 640.0)
+        fy = 525.0 * (h / 480.0)
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    print(f"[K-branch] {tag}  root_str={root_str}")
+    return dict(fx=fx, fy=fy, cx=cx, cy=cy)
+
+# ==========================
+# Depth / RGBD builder
+# ==========================
+
+def inpaint_depth_disparity(dm: np.ndarray, radius: int = 3):
+    """Fill zero-depth holes by inpainting *disparity* (1/z). Pragmatic depth completion.
+
+    This is NOT physically perfect, but for thin/reflective objects in TUM (e.g. flowerbouquet)
+    it can recover a plausible surface so TSDF has something to integrate.
+    """
+    dm = dm.astype(np.float32, copy=False)
+    valid = (dm > 1e-6) & np.isfinite(dm)
+    if int(valid.sum()) < 500:
+        return dm
+
+    hole = (~valid).astype(np.uint8) * 255
+
+    disp = np.zeros_like(dm, dtype=np.float32)
+    disp[valid] = 1.0 / np.clip(dm[valid], 1e-6, None)
+
+    # robust normalize for inpaint
+    dmin = float(np.quantile(disp[valid], 0.02))
+    dmax = float(np.quantile(disp[valid], 0.98))
+    if not np.isfinite(dmin) or not np.isfinite(dmax) or dmax <= dmin + 1e-9:
+        return dm
+
+    disp8 = ((disp - dmin) / (dmax - dmin) * 255.0).clip(0, 255).astype(np.uint8)
+    filled8 = cv2.inpaint(disp8, hole, int(max(1, radius)), cv2.INPAINT_TELEA)
+    filled = (filled8.astype(np.float32) / 255.0) * (dmax - dmin) + dmin
+
+    dm_fill = 1.0 / np.clip(filled, 1e-6, None)
+    out = dm.copy()
+    out[~valid] = dm_fill[~valid]
+    return out
+def apply_center_ellipse_roi(dm: np.ndarray, scale: float):
+    H, W = dm.shape
+    xs, ys = np.meshgrid(np.arange(W), np.arange(H))
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    rx, ry = scale * W, scale * H
+    mask = ((xs - cx) ** 2) / (rx ** 2) + ((ys - cy) ** 2) / (ry ** 2) <= 1.0
+    dm2 = dm.copy()
+    dm2[~mask] = 0.0
+    return dm2
+
+def apply_rect_roi(dm: np.ndarray, roi_rect):
+    x, y, w, h = map(int, roi_rect)
+    H, W = dm.shape
+    x0, x1 = max(0, x), min(W, x + w)
+    y0, y1 = max(0, y), min(H, y + h)
+    dm2 = np.zeros_like(dm)
+    dm2[y0:y1, x0:x1] = dm[y0:y1, x0:x1]
+    return dm2
+
+
+def remove_dominant_planes_in_roi_depth(dm: np.ndarray, roi_rect, K: np.ndarray,
+                                        n_planes: int = 1,
+                                        dist_th: float = 0.012,
+                                        ransac_iters: int = 80,
+                                        min_inlier_ratio: float = 0.25,
+                                        min_inlier_pts: int = 3000,
+                                        subsample: int = 15000,
+                                        bias_bottom_frac: float = 0.0,
+                                        fit_center_frac: float = 1.0,
+                                        debug: bool = False) -> np.ndarray:
+    """Remove dominant plane(s) in ROI depth by RANSAC plane fitting.
+
+    Strategy:
+      1) Convert ROI depth pixels to 3D points using intrinsics K.
+      2) Fit a plane with Open3D RANSAC (on a subsample).
+      3) Classify ALL ROI points by distance-to-plane and zero inliers in depth.
+      4) Repeat up to n_planes times.
+
+    This prevents large planar background (table / wall) from continuously overwriting
+    small foreground geometry in TSDF (the "后期被抹平" failure mode).
+    """
+    if dm is None or roi_rect is None or K is None:
+        return dm
+
+    x, y, w, h = map(int, roi_rect)
+    H, W = dm.shape
+    x0, x1 = max(0, x), min(W, x + w)
+    y0, y1 = max(0, y), min(H, y + h)
+    if (x1 - x0) < 4 or (y1 - y0) < 4:
+        return dm
+
+    roi = dm[y0:y1, x0:x1].copy()
+    valid = (roi > 0) & np.isfinite(roi)
+    n_valid = int(valid.sum())
+    if n_valid < 2000:
+        return dm
+
+    # Pixel coords in ROI-local frame
+    vv, uu = valid.nonzero()  # row (v), col (u)
+    z = roi[vv, uu].astype(np.float32)
+
+    # Convert to global pixel coords
+    u = (uu + x0).astype(np.float32)
+    v = (vv + y0).astype(np.float32)
+
+    fx = float(K[0, 0]); fy = float(K[1, 1])
+    cx = float(K[0, 2]); cy = float(K[1, 2])
+
+    X = (u - cx) * z / fx
+    Y = (v - cy) * z / fy
+    Z = z
+    pts = np.stack([X, Y, Z], axis=1)  # (N,3)
+
+    keep = np.ones((pts.shape[0],), dtype=bool)
+
+    for pi in range(int(max(0, n_planes))):
+        idx_cur = np.flatnonzero(keep)
+        if idx_cur.size < 2000:
+            break
+        pts_cur = pts[idx_cur]
+
+        # Build a biased subset for the FIRST plane fit (helps target the table instead of walls).
+
+
+        pts_for_fit = pts_cur
+
+
+        if pi == 0:
+
+
+            bf = float(bias_bottom_frac) if bias_bottom_frac is not None else 0.0
+
+
+            cf = float(fit_center_frac) if fit_center_frac is not None else 1.0
+
+
+            if (bf > 0.0) or (cf < 1.0):
+
+
+                hh, ww = roi.shape
+
+
+                vv_cur = vv[idx_cur]
+
+
+                uu_cur = uu[idx_cur]
+
+
+                mask = np.ones((idx_cur.size,), dtype=bool)
+
+
+                if 0.05 < bf < 0.98:
+
+
+                    y_start = int(round((1.0 - bf) * hh))
+
+
+                    mask &= (vv_cur >= y_start)
+
+
+                if 0.20 < cf < 0.98:
+
+
+                    cx0 = int(round((1.0 - cf) * 0.5 * ww))
+
+
+                    cx1 = ww - cx0
+
+
+                    cy0 = int(round((1.0 - cf) * 0.5 * hh))
+
+
+                    cy1 = hh - cy0
+
+
+                    mask &= (uu_cur >= cx0) & (uu_cur < cx1) & (vv_cur >= cy0) & (vv_cur < cy1)
+
+
+                idx_fit = idx_cur[mask]
+
+
+                if idx_fit.size >= 800:
+
+
+                    pts_for_fit = pts[idx_fit]
+
+
+                if debug:
+
+
+                    print(f"[plane] #1 fit_bias fit_n={int(pts_for_fit.shape[0])} cur_n={int(pts_cur.shape[0])} bottom_frac={bf:.2f} center_frac={cf:.2f}")
+
+
+        
+
+
+        # Subsample for RANSAC fit
+
+
+        if subsample is not None and int(subsample) > 0 and pts_for_fit.shape[0] > int(subsample):
+
+
+            sel = np.random.choice(pts_for_fit.shape[0], int(subsample), replace=False)
+
+
+            pts_fit = pts_for_fit[sel]
+
+
+        else:
+
+
+            pts_fit = pts_for_fit
+
+
+        
+
+
+        # Open3D expects float64
+
+
+        
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_fit.astype(np.float64, copy=False))
+
+        try:
+            plane_model, _inliers = pcd.segment_plane(distance_threshold=float(dist_th),
+                                                      ransac_n=3,
+                                                      num_iterations=int(ransac_iters))
+        except Exception:
+            break
+
+        a, b, c, d = [float(x) for x in plane_model]
+        nrm = (a*a + b*b + c*c) ** 0.5
+        if not np.isfinite(nrm) or nrm < 1e-9:
+            break
+
+        # Classify ALL current points w.r.t this plane
+        dist = np.abs(pts_cur[:, 0] * a + pts_cur[:, 1] * b + pts_cur[:, 2] * c + d) / nrm
+        inl = dist < float(dist_th)
+        ratio = float(inl.mean())
+
+        if debug:
+            print(f"[plane] #{pi+1} ratio={ratio:.3f} dist_th={dist_th:.3f} n={inl.sum()}/{inl.size}")
+
+        if (int(inl.sum()) < int(min_inlier_pts)) and (ratio < float(min_inlier_ratio)):
+            # not a dominant plane
+            break
+
+        # Zero plane inliers in depth (ROI-local indices)
+        idx_inl = idx_cur[inl]
+        roi[vv[idx_inl], uu[idx_inl]] = 0.0
+        keep[idx_inl] = False
+
+    out = dm.copy()
+    out[y0:y1, x0:x1] = roi
+    return out
+
+
+
+# ==========================
+# Occlusion-aware TSDF gating helpers
+# ==========================
+def _voxel_downsample_points_np(pts: np.ndarray, voxel: float, max_pts: int = None) -> np.ndarray:
+    """Voxel downsample numpy Nx3 points using Open3D (CPU)."""
+    if pts is None:
+        return None
+    if pts.shape[0] == 0:
+        return pts
+    try:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64, copy=False))
+        pcd = pcd.voxel_down_sample(float(voxel))
+        out = np.asarray(pcd.points, dtype=np.float32)
+    except Exception:
+        out = pts.astype(np.float32, copy=False)
+
+    if (max_pts is not None) and (out.shape[0] > int(max_pts)):
+        # deterministic subsample
+        step = max(1, out.shape[0] // int(max_pts))
+        out = out[::step].copy()
+    return out
+
+
+def collect_ref_points_from_depth(dm_full: np.ndarray, roi_rect, K: np.ndarray, T_cw: np.ndarray,
+                                  center_frac: float = 1.0,
+                                  exclude_bottom_frac: float = 0.0,
+                                  max_samples: int = 18000) -> np.ndarray:
+    """
+    Collect a sparse set of world points from the current depth map for later occlusion gating.
+    Assumes dm_full is already ROI-masked / windowed (0 = invalid).
+    """
+    H, W = dm_full.shape[:2]
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    if roi_rect is not None:
+        x, y, w, h = map(int, roi_rect)
+        x0, y0, w0, h0 = x, y, w, h
+
+        # center crop within ROI (reduce influence of wall/background at ROI edges)
+        if center_frac is not None and center_frac < 0.999:
+            cf = float(center_frac)
+            dx = int(round(0.5 * (1.0 - cf) * w0))
+            dy = int(round(0.5 * (1.0 - cf) * h0))
+            x0 = x0 + dx
+            y0 = y0 + dy
+            w0 = max(1, w0 - 2 * dx)
+            h0 = max(1, h0 - 2 * dy)
+
+        # exclude bottom part (reduce table)
+        if exclude_bottom_frac and exclude_bottom_frac > 0:
+            cut = int(round(float(exclude_bottom_frac) * h0))
+            h0 = max(1, h0 - cut)
+
+        dm = dm_full[y0:y0 + h0, x0:x0 + w0]
+        if dm.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        vv, uu = np.nonzero(dm > 0)
+        if vv.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        z = dm[vv, uu].astype(np.float32, copy=False)
+        u = (uu + x0).astype(np.float32, copy=False)
+        v = (vv + y0).astype(np.float32, copy=False)
+    else:
+        vv, uu = np.nonzero(dm_full > 0)
+        if vv.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        z = dm_full[vv, uu].astype(np.float32, copy=False)
+        u = uu.astype(np.float32, copy=False)
+        v = vv.astype(np.float32, copy=False)
+
+    # subsample for speed/memory
+    n = int(z.shape[0])
+    if (max_samples is not None) and (n > int(max_samples)):
+        # deterministic stride to avoid RNG dependence
+        step = max(1, n // int(max_samples))
+        u = u[::step]; v = v[::step]; z = z[::step]
+
+    X = (u - cx) * z / fx
+    Y = (v - cy) * z / fy
+    pts_c = np.stack([X, Y, z], axis=1).astype(np.float32, copy=False)
+
+    R = T_cw[:3, :3].astype(np.float64, copy=False)
+    t = T_cw[:3, 3].astype(np.float64, copy=False)
+
+    pts_w = (R @ pts_c.astype(np.float64).T).T + t[None, :]
+    return pts_w.astype(np.float32, copy=False)
+
+
+def project_ref_zbuffer(ref_pts_w: np.ndarray, roi_rect, K: np.ndarray, T_cw: np.ndarray,
+                        out_hw, max_project_pts: int = None):
+    """
+    Project reference world points into current camera to form a per-pixel z-buffer (min depth along ray).
+    Returns (zbuf, hits). zbuf is np.float32 with +inf for invalid pixels.
+    """
+    if ref_pts_w is None or ref_pts_w.shape[0] == 0:
+        return None, 0
+
+    H, W = out_hw
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    pts_w = ref_pts_w
+    if (max_project_pts is not None) and (pts_w.shape[0] > int(max_project_pts)):
+        step = max(1, pts_w.shape[0] // int(max_project_pts))
+        pts_w = pts_w[::step]
+
+    # world -> camera
+    try:
+        T_wc = np.linalg.inv(T_cw)
+    except Exception:
+        T_wc = np.eye(4, dtype=np.float64)
+
+    R = T_wc[:3, :3].astype(np.float64, copy=False)
+    t = T_wc[:3, 3].astype(np.float64, copy=False)
+    pts_c = (R @ pts_w.astype(np.float64).T).T + t[None, :]
+
+    Z = pts_c[:, 2]
+    good = Z > 1e-6
+    if not np.any(good):
+        return None, 0
+    X = pts_c[good, 0]
+    Y = pts_c[good, 1]
+    Z = Z[good]
+
+    u = (fx * (X / Z) + cx)
+    v = (fy * (Y / Z) + cy)
+
+    ui = np.floor(u + 0.5).astype(np.int32)
+    vi = np.floor(v + 0.5).astype(np.int32)
+
+    if roi_rect is not None:
+        x, y, w, h = map(int, roi_rect)
+        inside = (ui >= x) & (ui < x + w) & (vi >= y) & (vi < y + h)
+        if not np.any(inside):
+            return None, 0
+        ui = ui[inside] - x
+        vi = vi[inside] - y
+        Z = Z[inside].astype(np.float32, copy=False)
+
+        zflat = np.full((h * w,), np.inf, dtype=np.float32)
+        idx = vi.astype(np.int64) * int(w) + ui.astype(np.int64)
+        np.minimum.at(zflat, idx, Z)
+        zbuf = zflat.reshape((h, w))
+    else:
+        inside = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+        if not np.any(inside):
+            return None, 0
+        ui = ui[inside]
+        vi = vi[inside]
+        Z = Z[inside].astype(np.float32, copy=False)
+
+        zflat = np.full((H * W,), np.inf, dtype=np.float32)
+        idx = vi.astype(np.int64) * int(W) + ui.astype(np.int64)
+        np.minimum.at(zflat, idx, Z)
+        zbuf = zflat.reshape((H, W))
+
+    hits = int(np.isfinite(zbuf).sum())
+    return zbuf, hits
+
+
+def apply_occlusion_gating(dm_full: np.ndarray, zbuf, roi_rect, tol: float) -> int:
+    """Zero out depth samples that are significantly behind the reference surface."""
+    if zbuf is None:
+        return 0
+    rej = 0
+    if roi_rect is not None:
+        x, y, w, h = map(int, roi_rect)
+        roi = dm_full[y:y + h, x:x + w]
+        if roi.size == 0:
+            return 0
+        valid = np.isfinite(zbuf)
+        mask = (roi > 0) & valid & (roi > (zbuf + float(tol)))
+        rej = int(mask.sum())
+        roi[mask] = 0.0
+        dm_full[y:y + h, x:x + w] = roi
+    else:
+        valid = np.isfinite(zbuf)
+        mask = (dm_full > 0) & valid & (dm_full > (zbuf + float(tol)))
+        rej = int(mask.sum())
+        dm_full[mask] = 0.0
+    return rej
+
+
+def keep_nearest_cluster_in_roi_depth(dm: np.ndarray, roi_rect, K: np.ndarray,
+                                     eps: float = 0.03,
+                                     min_points: int = 25,
+                                     keep_mode: str = "nearest",
+                                     max_pts: int = 60000,
+                                     debug: bool = False) -> np.ndarray:
+    """Keep only the nearest (or largest) 3D connected cluster in ROI.
+
+    Rationale: after plane removal, remaining points may still include wall/background. DBSCAN separates them.
+    Keeping the nearest cluster makes TSDF integrate the vase/flowers instead of background.
+    """
+    if dm is None or roi_rect is None or K is None:
+        return dm
+
+    x, y, w, h = map(int, roi_rect)
+    H, W = dm.shape
+    x0, x1 = max(0, x), min(W, x + w)
+    y0, y1 = max(0, y), min(H, y + h)
+    if (x1 - x0) < 4 or (y1 - y0) < 4:
+        return dm
+
+    roi = dm[y0:y1, x0:x1].copy()
+    valid = (roi > 0) & np.isfinite(roi)
+    n_valid = int(valid.sum())
+    if n_valid < 2500:
+        return dm
+
+    vv, uu = valid.nonzero()
+    z = roi[vv, uu].astype(np.float32)
+
+    # Cap points for runtime if ROI is huge
+    if max_pts is not None and int(max_pts) > 0 and z.size > int(max_pts):
+        sel = np.random.choice(z.size, int(max_pts), replace=False)
+        vv = vv[sel]; uu = uu[sel]; z = z[sel]
+
+    u = (uu + x0).astype(np.float32)
+    v = (vv + y0).astype(np.float32)
+
+    fx = float(K[0, 0]); fy = float(K[1, 1])
+    cx = float(K[0, 2]); cy = float(K[1, 2])
+
+    X = (u - cx) * z / fx
+    Y = (v - cy) * z / fy
+    Z = z
+    pts = np.stack([X, Y, Z], axis=1)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64, copy=False))
+
+    try:
+        labels = np.array(pcd.cluster_dbscan(eps=float(eps), min_points=int(min_points), print_progress=False), dtype=np.int32)
+    except Exception:
+        return dm
+
+    if labels.size == 0 or labels.max() < 0:
+        return dm
+
+    best = None
+    best_key = None
+
+    for cid in range(int(labels.max()) + 1):
+        m = (labels == cid)
+        cnt = int(m.sum())
+        if cnt < int(min_points):
+            continue
+        z_med = float(np.median(Z[m]))
+        if keep_mode == "largest":
+            key = (cnt, -z_med)  # larger first, then nearer
+        else:  # nearest
+            key = (-z_med, cnt)  # nearer first, then larger
+        if (best is None) or (key > best_key):
+            best = cid
+            best_key = key
+
+    if best is None:
+        return dm
+
+    keep = (labels == int(best))
+
+    if debug:
+        cnt_keep = int(keep.sum())
+        print(f"[cluster] keep_mode={keep_mode} cid={best} keep={cnt_keep}/{labels.size} z_med={float(np.median(Z[keep])):.3f}")
+
+    roi2 = np.zeros_like(roi)
+    roi2[vv[keep], uu[keep]] = roi[vv[keep], uu[keep]]
+
+    out = dm.copy()
+    out[y0:y1, x0:x1] = roi2
+    return out
+
+
+def inpaint_depth_disparity(dm: np.ndarray, radius: int = 3):
+    """Fill zero-depth holes by inpainting *disparity* (1/z).
+
+    Pragmatic depth completion to recover thin structures (e.g., flowerbouquet leaves)
+    that often have invalid depth in TUM RGB-D.
+    """
+    dm = dm.astype(np.float32, copy=False)
+    valid = (dm > 1e-6) & np.isfinite(dm)
+    if int(valid.sum()) < 500:
+        return dm
+
+    hole = (~valid).astype(np.uint8) * 255
+    disp = np.zeros_like(dm, dtype=np.float32)
+    disp[valid] = 1.0 / np.clip(dm[valid], 1e-6, None)
+
+    dmin = float(np.quantile(disp[valid], 0.02))
+    dmax = float(np.quantile(disp[valid], 0.98))
+    if (not np.isfinite(dmin)) or (not np.isfinite(dmax)) or dmax <= dmin + 1e-9:
+        return dm
+
+    disp8 = ((disp - dmin) / (dmax - dmin) * 255.0).clip(0, 255).astype(np.uint8)
+    filled8 = cv2.inpaint(disp8, hole, int(max(1, radius)), cv2.INPAINT_TELEA)
+    filled = (filled8.astype(np.float32) / 255.0) * (dmax - dmin) + dmin
+
+    dm_fill = 1.0 / np.clip(filled, 1e-6, None)
+    out = dm.copy()
+    out[~valid] = dm_fill[~valid]
+    return out
+
+
+def depth_window_inside_roi(dm, roi_rect, near_clip, far_clip, *,
+                           policy: str = "median", q: float = 0.10,
+                           halfwin: float = 0.20, margin: float = 0.02,
+                           band_q_lo: float | None = None,
+                           band_q_hi: float | None = None,
+                           band_pad: float | None = None,
+                           band_exclude_bottom_frac: float | None = None,
+                           band_trim_near_q: float | None = None,
+                           band_kmeans2: bool | None = None,
+                           band_kmeans_iters: int | None = None,
+                           lock_enabled: bool = False,
+                           lock_center_frac: float | None = None,
+                           min_keep_px: int | None = None,
+                           min_keep_frac: float | None = None):
+    """Keep a depth *band* inside ROI, zeroing out everything else.
+
+    Key for TUM flowerbouquet_brownbackground:
+    - Later frames often lose depth on thin/reflective parts (vase/flowers).
+    - If your ROI band is recomputed each frame, it drifts to background (table/wall),
+      and TSDF will overwrite the small object -> "后期被抹平".
+
+    Supported policies:
+      - 'nearest': center at quantile(q)
+      - 'median' : center at median
+      - 'band'   : keep [quantile(q_lo)-pad, quantile(q_hi)+pad]
+
+    Lock behavior:
+      - For 'nearest'/'median': locks center depth (FG_Z_REF).
+      - For 'band'            : locks the [lo,hi] band itself (FG_BAND_LO/FG_BAND_HI).
+        When locking, we optionally estimate the initial band from the ROI *center crop*
+        (FG_LOCK_CENTER_FRAC) to bias toward the vase and avoid ROI-edge background.
+
+    Foreground-presence gate (optional):
+      - If kept pixels are too few, we zero the ROI (so TSDF will not integrate that frame).
+    """
+    if roi_rect is None:
+        return dm
+
+    x, y, w, h = map(int, roi_rect)
+    H, W = dm.shape
+    x0, x1 = max(0, x), min(W, x + w)
+    y0, y1 = max(0, y), min(H, y + h)
+
+    dm2 = dm.copy()
+    roi = dm2[y0:y1, x0:x1]
+
+    pol = (policy or "median").lower()
+
+    valid = (roi > 0) & np.isfinite(roi)
+    z = roi[valid]
+
+    # ----- globals for lock -----
+    global FG_Z_REF, FG_BAND_LO, FG_BAND_HI, FG_LOCK_CENTER_FRAC
+    if lock_center_frac is None:
+        try:
+            lock_center_frac = float(FG_LOCK_CENTER_FRAC)
+        except Exception:
+            lock_center_frac = 0.60
+
+    # If we don't have enough depth to estimate a band/center, only early-return when
+    # there's also no existing lock to fall back to.
+    if z.size <= 300:
+        if pol == "band" and lock_enabled and (FG_BAND_LO is not None) and (FG_BAND_HI is not None):
+            pass
+        elif pol in ("nearest", "median") and lock_enabled and (FG_Z_REF is not None):
+            pass
+        else:
+            return dm2
+
+    # ----- compute [lo, hi] -----
+    lo = None
+    hi = None
+
+    if pol == "band":
+        # Prefer locked band if available
+        if lock_enabled and (FG_BAND_LO is not None) and (FG_BAND_HI is not None):
+            lo = float(FG_BAND_LO)
+            hi = float(FG_BAND_HI)
+        else:
+            q_lo = float(band_q_lo if band_q_lo is not None else 0.05)
+            q_hi = float(band_q_hi if band_q_hi is not None else 0.65)
+            pad  = float(band_pad  if band_pad  is not None else 0.03)
+
+            # ----- choose samples for band estimation (robust to table dominance) -----
+            roi_sel = roi
+            # (1) optional center crop to bias toward vase
+            if lock_enabled and (0.10 < float(lock_center_frac) < 0.98):
+                hh, ww = roi_sel.shape
+                cw = max(4, int(round(ww * float(lock_center_frac))))
+                ch = max(4, int(round(hh * float(lock_center_frac))))
+                xs = max(0, (ww - cw) // 2); ys = max(0, (hh - ch) // 2)
+                roi_c = roi_sel[ys:ys+ch, xs:xs+cw]
+                zc = roi_c[(roi_c > 0) & np.isfinite(roi_c)]
+                if zc.size >= max(600, int(0.15 * max(1, z.size))):
+                    roi_sel = roi_c
+
+            # (2) optional exclude bottom part (table usually sits in ROI lower region)
+            if band_exclude_bottom_frac is not None and float(band_exclude_bottom_frac) > 1e-6:
+                hh, ww = roi_sel.shape
+                cut = int(round(float(band_exclude_bottom_frac) * hh))
+                if cut >= 2 and (hh - cut) >= 4:
+                    roi_sel = roi_sel[:hh - cut, :]
+
+            z_for = roi_sel[(roi_sel > 0) & np.isfinite(roi_sel)]
+            if z_for.size < 300:
+                z_for = z
+
+            # (3) optional trim nearest tail (table is often the nearest dominant surface)
+            if band_trim_near_q is not None and float(band_trim_near_q) > 1e-6 and z_for.size > 500:
+                tq = float(band_trim_near_q)
+                tq = min(max(tq, 0.0), 0.95)
+                zmin = float(np.quantile(z_for, tq))
+                zt = z_for[z_for >= zmin]
+                if zt.size >= 300:
+                    z_for = zt
+
+
+            # (4) optional 1D kmeans (k=2) on depth to separate vase (near) vs wall (far)
+            if band_kmeans2 is None:
+                try:
+                    band_kmeans2 = bool(INTEGRATE_BAND_KMEANS2)
+                except Exception:
+                    band_kmeans2 = False
+            if band_kmeans_iters is None:
+                try:
+                    band_kmeans_iters = int(INTEGRATE_BAND_KMEANS_ITERS)
+                except Exception:
+                    band_kmeans_iters = 10
+
+            if bool(band_kmeans2) and z_for.size >= 2000:
+                zz = z_for.astype(np.float32, copy=False)
+                # init centers from quantiles
+                m0 = float(np.quantile(zz, 0.25))
+                m1 = float(np.quantile(zz, 0.80))
+                if m1 < m0:
+                    m0, m1 = m1, m0
+
+                lab = None
+                for _ in range(int(max(3, band_kmeans_iters))):
+                    d0 = np.abs(zz - m0)
+                    d1 = np.abs(zz - m1)
+                    lab = d0 <= d1
+                    n0 = int(lab.sum()); n1 = int((~lab).sum())
+                    if n0 < 300 or n1 < 300:
+                        lab = None
+                        break
+                    m0_new = float(zz[lab].mean())
+                    m1_new = float(zz[~lab].mean())
+                    if abs(m0_new - m0) < 1e-4 and abs(m1_new - m1) < 1e-4:
+                        m0, m1 = m0_new, m1_new
+                        break
+                    m0, m1 = m0_new, m1_new
+
+                if lab is not None:
+                    # choose the nearer cluster (smaller mean depth)
+                    if m0 <= m1:
+                        z_fg = zz[lab]
+                    else:
+                        z_fg = zz[~lab]
+                    if z_fg.size >= 400:
+                        z_for = z_fg
+
+            z_lo = float(np.quantile(z_for, q_lo))
+            z_hi = float(np.quantile(z_for, q_hi))
+
+            lo = max(float(near_clip), z_lo - pad)
+            hi = min(float(far_clip),  z_hi + pad)
+
+            # sanity clamp: avoid degenerate / overly-wide bands
+            min_w = 0.08   # meters
+            max_w = 1.20   # meters
+            if (hi - lo) < min_w:
+                mid = 0.5 * (hi + lo)
+                lo = max(float(near_clip), mid - 0.5 * min_w)
+                hi = min(float(far_clip),  mid + 0.5 * min_w)
+            if (hi - lo) > max_w:
+                mid = 0.5 * (hi + lo)
+                lo = max(float(near_clip), mid - 0.5 * max_w)
+                hi = min(float(far_clip),  mid + 0.5 * max_w)
+
+            if lock_enabled and (FG_BAND_LO is None) and (FG_BAND_HI is None):
+                FG_BAND_LO = float(lo)
+                FG_BAND_HI = float(hi)
+                try:
+                    print(f"[fg-lock] band lo={FG_BAND_LO:.3f} hi={FG_BAND_HI:.3f} (center_frac={float(lock_center_frac):.2f}, excl_bot={float(band_exclude_bottom_frac or 0.0):.2f}, trim_near_q={float(band_trim_near_q or 0.0):.2f})")
+                except Exception:
+                    pass
+
+    else:
+        # center-based window
+        z_ref = None
+        if lock_enabled and (FG_Z_REF is not None):
+            z_ref = float(FG_Z_REF)
+
+        if z_ref is None:
+            if pol == "nearest":
+                z_ref = float(np.quantile(z, float(q)))
+            else:
+                z_ref = float(np.median(z))
+            if lock_enabled and (FG_Z_REF is None):
+                FG_Z_REF = float(z_ref)
+
+        lo = max(float(near_clip), z_ref - float(halfwin) - float(margin))
+        hi = min(float(far_clip),  z_ref + float(halfwin) + float(margin))
+
+    if (lo is None) or (hi is None) or (hi <= lo + 1e-6):
+        return dm2
+
+    keep = (roi >= lo) & (roi <= hi)
+    roi[~keep] = 0.0
+
+    keep_px = int(keep.sum())
+    if min_keep_px is not None and keep_px < int(min_keep_px):
+        roi[...] = 0.0
+    elif min_keep_frac is not None and float(min_keep_frac) > 0.0:
+        if keep_px < float(min_keep_frac) * float(roi.size):
+            roi[...] = 0.0
+
+    # Optional hole fill (WARNING: can hallucinate background if depth is truly missing)
+    if ROI_DEPTH_INPAINT and (roi > 0).any():
+        roi = inpaint_depth_disparity(roi, radius=int(ROI_INPAINT_RADIUS))
+        roi[(roi < lo) | (roi > hi) | ~np.isfinite(roi)] = 0.0
+
+    dm2[y0:y1, x0:x1] = roi
+    return dm2
+
+def make_frame(color_path: Path, depth_path: Path,
+               near_clip: float, far_clip: float,
+               roi_rect=None,
+               roi_depth_halfwin: float = 0.30):
+    """Return:
+      - color_rgb (uint8 RGB)
+      - dm_full (float32 meters, clipped, filtered)
+      - dm_track (float32 meters, additional ROI/windowing for ICP)
+    """
+    global K_GLOBAL, K_READY
+    c = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
+    d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    if c is None or d is None:
+        raise FileNotFoundError(f"读取失败: {color_path.name}, {depth_path.name}")
+
+    dm = depth_to_meters(d).astype(np.float32)
+    dm[(dm < float(near_clip)) | (dm > float(far_clip)) | ~np.isfinite(dm)] = 0.0
+
+    # bilateral only on valid pixels
+    if (dm > 0).any():
+        dm_f = GP.bilateral(dm, d=5, sigmaColor=0.05, sigmaSpace=3)
+        dm[dm > 0] = dm_f[dm > 0]
+
+    if AUTO_BG_OTSU:
+        dm = cut_background_otsu(dm)
+
+    dm_full = dm
+
+    # Tracking depth
+    dm_track = dm_full
+    if TRACK_USE_ROI:
+        if roi_rect is not None:
+            dm_track = apply_rect_roi(dm_track, roi_rect)
+            dm_track = depth_window_inside_roi(
+                dm_track, roi_rect, near_clip, far_clip,
+                policy=TRACK_ROI_DEPTH_POLICY, q=TRACK_ROI_DEPTH_Q,
+                halfwin=TRACK_ROI_DEPTH_HALFWIN, margin=TRACK_ROI_DEPTH_MARGIN,
+                lock_enabled=False
+            )
+        elif USE_CENTER_ROI:
+            dm_track = apply_center_ellipse_roi(dm_track, ROI_SCALE)
+
+    # Integration depth (default: full depth)
+    if INTEGRATE_USE_ROI:
+        if roi_rect is not None:
+            dm_full = apply_rect_roi(dm_full, roi_rect)
+            if INTEGRATE_ROI_DEPTH_WINDOW:
+                # Remove large planes (table / wall) before computing/locking the band.
+                # This prevents the locked band from being dominated by background planes.
+                if INTEGRATE_REMOVE_DOMINANT_PLANES and K_READY and (K_GLOBAL is not None):
+                    dm_full = remove_dominant_planes_in_roi_depth(
+                        dm_full, roi_rect, K_GLOBAL,
+                        n_planes=int(PLANE_REMOVE_N),
+                        dist_th=float(PLANE_RANSAC_DIST),
+                        ransac_iters=int(PLANE_RANSAC_ITERS),
+                        min_inlier_ratio=float(PLANE_MIN_INLIER_RATIO),
+                        min_inlier_pts=int(PLANE_MIN_INLIER_PTS),
+                        subsample=int(PLANE_SUBSAMPLE),
+                        bias_bottom_frac=float(PLANE_BIAS_BOTTOM_FRAC),
+                        fit_center_frac=float(PLANE_FIT_CENTER_FRAC),
+                        debug=False
+                    )
+
+                # Keep nearest foreground cluster after plane removal (separates vase/flowers from wall)
+                if FG_CLUSTER_FILTER and K_READY and (K_GLOBAL is not None):
+                    dm_full = keep_nearest_cluster_in_roi_depth(
+                        dm_full, roi_rect, K_GLOBAL,
+                        eps=float(CLUSTER_EPS),
+                        min_points=int(CLUSTER_MIN_POINTS),
+                        keep_mode=str(CLUSTER_KEEP_MODE),
+                        debug=False
+                    )
+
+                dm_full = depth_window_inside_roi(
+                    dm_full, roi_rect, near_clip, far_clip,
+                    policy=INTEGRATE_ROI_DEPTH_POLICY, q=INTEGRATE_ROI_DEPTH_Q,
+                    halfwin=INTEGRATE_ROI_DEPTH_HALFWIN, margin=INTEGRATE_ROI_DEPTH_MARGIN,
+                    band_q_lo=INTEGRATE_BAND_Q_LO, band_q_hi=INTEGRATE_BAND_Q_HI, band_pad=INTEGRATE_BAND_PAD,
+                    band_exclude_bottom_frac=INTEGRATE_BAND_EXCLUDE_BOTTOM_FRAC,
+                    band_trim_near_q=INTEGRATE_BAND_TRIM_NEAR_Q,
+                    band_kmeans2=INTEGRATE_BAND_KMEANS2,
+                    band_kmeans_iters=INTEGRATE_BAND_KMEANS_ITERS,
+                    lock_enabled=(FG_DEPTH_LOCK and K_READY),
+                    lock_center_frac=FG_LOCK_CENTER_FRAC,
+                    min_keep_px=INTEGRATE_MIN_KEEP_PX,
+                    min_keep_frac=INTEGRATE_MIN_KEEP_FRAC
+                )
+
+    color_rgb = GP.bgr2rgb(c)
+    return color_rgb, dm_full.astype(np.float32), dm_track.astype(np.float32)
+
+def build_o3d_rgbd(color_rgb: np.ndarray, dm: np.ndarray, depth_trunc: float):
+    return o3d.geometry.RGBDImage.create_from_color_and_depth(
+        o3d.geometry.Image(color_rgb),
+        o3d.geometry.Image(dm.astype(np.float32)),
+        depth_scale=1.0,
+        depth_trunc=float(depth_trunc),
+        convert_rgb_to_intensity=False
+    )
+
+def make_pcd_from_rgbd_o3d(rgbd, intr, voxel=0.014):
+    pc = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intr)
+    if voxel > 0:
+        pc = pc.voxel_down_sample(voxel)
+    return pc
+
+# ==========================
+# ICP helpers
+# ==========================
+def angle_from_R(R: np.ndarray) -> float:
+    t = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(t)))
+
+def reasonable(T: np.ndarray, max_t: float, max_r_deg: float) -> bool:
+    return (np.linalg.norm(T[:3, 3]) <= max_t) and (angle_from_R(T[:3, :3]) <= max_r_deg)
+
+def orb_pnp_init_cuda(color_prev_rgb, depth_prev_m, color_cur_rgb, intr_mat,
+                      max_pts=2500):
+    matches, kps0, kps1 = GP.orb_match(color_prev_rgb, color_cur_rgb, max_pts=max_pts)
+    if not matches:
+        return None
+
+    fx, fy, cx, cy = intr_mat[0, 0], intr_mat[1, 1], intr_mat[0, 2], intr_mat[1, 2]
+    dep = depth_prev_m
+    zz = dep[(dep > 0) & np.isfinite(dep)]
+    if zz.size > 100:
+        zmin = float(np.quantile(zz, 0.05)); zmax = float(np.quantile(zz, 0.95))
+        zmin = max(zmin, 0.2); zmax = min(zmax, 6.0)
+    else:
+        zmin, zmax = 0.2, 6.0
+
+    objp, imgp = [], []
+    for mm in matches:
+        u0, v0 = kps0[mm.queryIdx].pt
+        u1, v1 = kps1[mm.trainIdx].pt
+        z = dep[int(round(v0)), int(round(u0))]
+        if not np.isfinite(z) or z <= zmin or z >= zmax:
+            continue
+        X = (u0 - cx) * z / fx
+        Y = (v0 - cy) * z / fy
+        objp.append([X, Y, z])
+        imgp.append([u1, v1])
+
+    if len(objp) < 40:
+        return None
+
+    objp = np.asarray(objp, np.float32)
+    imgp = np.asarray(imgp, np.float32)
+
+    K = intr_mat.astype(np.float64)
+    ok, rvec, tvec, _ = cv2.solvePnPRansac(
+        objp, imgp, K, None,
+        iterationsCount=1500,
+        reprojectionError=2.5,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = tvec.reshape(3)
+    return T
+
+def colored_icp_multiscale(src, dst, init=np.eye(4)):
+    T = init.copy()
+    def prep(pcd, v):
+        q = pcd.voxel_down_sample(v)
+        if len(q.points) == 0:
+            return q
+        q.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=v * 3, max_nn=48))
+        q.orient_normals_towards_camera_location(np.array([0, 0, 0], dtype=np.float64))
+        return q
+    scales = [0.06, 0.04, 0.02]
+    dists  = [0.12, 0.08, 0.05]
+    reg_last = None
+    for v, corr in zip(scales, dists):
+        src_lvl = prep(src, v)
+        dst_lvl = prep(dst, v)
+        if len(src_lvl.points) < 300 or len(dst_lvl.points) < 300:
+            return None
+        try:
+            with _SilentStderr():
+                reg = o3d.pipelines.registration.registration_colored_icp(
+                    src_lvl, dst_lvl, corr, T,
+                    o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=12)
+                )
+        except Exception:
+            reg = None
+        if reg is None:
+            continue
+        T = reg.transformation
+        reg_last = reg
+    return reg_last
+
+def icp_point2plane_multiscale_robust(pc_prev, pc_cur, init=np.eye(4)):
+    T = init.copy()
+    pyr = [(0.08, 0.20, 20), (0.04, 0.12, 30), (0.02, 0.08, 50)]
+    loss = o3d.pipelines.registration.TukeyLoss(k=0.03)
+    est = o3d.pipelines.registration.TransformationEstimationPointToPlane(loss)
+    reg_last = None
+    for vxl, radius, it in pyr:
+        sp = pc_prev.voxel_down_sample(vxl)
+        dp = pc_cur.voxel_down_sample(vxl)
+        if len(sp.points) < 300 or len(dp.points) < 300:
+            return reg_last
+        sp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
+        dp.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
+        reg = o3d.pipelines.registration.registration_icp(
+            sp, dp, radius, T, est,
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=it)
+        )
+        if reg is None:
+            break
+        T = reg.transformation
+        reg_last = reg
+    return reg_last
+
+# ==========================
+# GT fuse
+# ==========================
+def gt_fuse_pose(T_cw_est, T_gt_aligned):
+    C_full = T_gt_aligned @ np.linalg.inv(T_cw_est)
+    xi = se3_log(C_full)
+    err_r = float(np.linalg.norm(xi[:3]))
+    err_t = float(np.linalg.norm(xi[3:]))
+    if (err_r > np.deg2rad(float(FUSE_REJECT_R_DEG))) or (err_t > float(FUSE_REJECT_T)):
+        return T_cw_est, False, err_r, err_t
+    xi_step = clamp_twist(xi * float(FUSE_ALPHA),
+                          max_r_rad=np.deg2rad(float(FUSE_MAX_R_DEG)),
+                          max_t=float(FUSE_MAX_T))
+    C_step = se3_exp(xi_step)
+    return (C_step @ T_cw_est), True, err_r, err_t
+
+# ==========================
+# TSDF wrapper (GPU tolerant + CPU fallback)
+# ==========================
+class TSDFWrapper:
+    def __init__(self, voxel_len: float, sdf_trunc: float, coarse_factor: float = 3.0):
+        self.request_gpu = bool(HAS_O3D_CUDA)
+        self.mode = "gpu" if self.request_gpu else "cpu"
+        self.backend = "legacy"
+
+        self.voxel_fine = float(voxel_len)
+        self.voxel_coarse = float(voxel_len) * max(1.0, float(coarse_factor))
+        self.sdf_trunc_fine = float(sdf_trunc)
+        self.sdf_trunc_coarse = float(sdf_trunc) * max(1.0, float(coarse_factor))
+
+        self.grid_fine = None
+        self.grid_coarse = None
+
+        self.trunc_mult_fine = max(1.0, self.sdf_trunc_fine / max(1e-9, self.voxel_fine))
+        self.trunc_mult_coarse = max(1.0, self.sdf_trunc_coarse / max(1e-9, self.voxel_coarse))
+
+        if self.mode == "gpu":
+            self.dev = o3d.core.Device("CUDA:0")
+
+            # Prefer VoxelBlockGrid (most common)
+            if hasattr(o3d.t.geometry, "VoxelBlockGrid"):
+                self.backend = "voxel_block_grid"
+
+                def _release_cuda_cache():
+                    try:
+                        if hasattr(o3d.core, "cuda") and hasattr(o3d.core.cuda, "release_cache"):
+                            o3d.core.cuda.release_cache()
+                    except Exception:
+                        pass
+
+                def _oom(e: Exception) -> bool:
+                    msg = str(e).lower()
+                    return ("out of memory" in msg) or ("cuda runtime error" in msg) or ("memorymanagercuda" in msg)
+
+                def _make_vbg(voxel_size: float, block_res: int, block_count: int):
+                    attr_names = ("tsdf", "weight", "color")
+                    attr_dtypes = (o3d.core.Dtype.Float32, o3d.core.Dtype.Float32, o3d.core.Dtype.Float32)
+                    attr_channels = (1, 1, 3)
+                    try:
+                        return o3d.t.geometry.VoxelBlockGrid(
+                            attr_names=attr_names,
+                            attr_dtypes=attr_dtypes,
+                            attr_channels=attr_channels,
+                            voxel_size=float(voxel_size),
+                            block_resolution=int(block_res),
+                            block_count=int(block_count),
+                            device=self.dev
+                        )
+                    except TypeError:
+                        return o3d.t.geometry.VoxelBlockGrid(
+                            attr_names, attr_dtypes, attr_channels,
+                            voxel_size=float(voxel_size),
+                            block_resolution=int(block_res),
+                            block_count=int(block_count),
+                            device=self.dev
+                        )
+
+                res0 = int(max(4, TSDF_GPU_BLOCK_RES))
+                fine0 = int(max(1000, TSDF_GPU_BLOCK_COUNT_FINE))
+                coarse0 = int(max(500, TSDF_GPU_BLOCK_COUNT_COARSE))
+                candidates = [(res0, fine0, coarse0)]
+                if TSDF_GPU_OOM_RETRY:
+                    candidates += [
+                        (res0, max(2000, fine0 // 2), max(1000, coarse0 // 2)),
+                        (res0, max(2000, fine0 // 4), max(1000, coarse0 // 4)),
+                        (max(4, res0 // 2), max(1500, fine0 // 4), max(800, coarse0 // 4)),
+                    ]
+
+                last_err = None
+                for br, bc_f, bc_c in candidates:
+                    try:
+                        self.grid_fine = _make_vbg(self.voxel_fine, br, bc_f)
+                        if TSDF_GPU_ENABLE_COARSE:
+                            try:
+                                self.grid_coarse = _make_vbg(self.voxel_coarse, br, bc_c)
+                            except Exception as e2:
+                                if _oom(e2):
+                                    _release_cuda_cache()
+                                    self.grid_coarse = None
+                                else:
+                                    raise
+                        else:
+                            self.grid_coarse = None
+                        print(f"[tsdf-gpu] VoxelBlockGrid ok: block_res={br}, fine_blocks={bc_f}, coarse_blocks={bc_c if self.grid_coarse is not None else 0}")
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if _oom(e):
+                            print(f"[tsdf-gpu] alloc failed -> retry smaller (block_res={br}, fine={bc_f}, coarse={bc_c})")
+                            _release_cuda_cache()
+                            self.grid_fine = None
+                            self.grid_coarse = None
+                            continue
+                        else:
+                            raise
+
+                if self.grid_fine is None:
+                    print(f"[tsdf-gpu] Failed to allocate GPU TSDF. Fallback to CPU. last_err={repr(last_err)}")
+                    self.mode = "cpu"
+                    self.backend = "legacy"
+
+            else:
+                # If no VoxelBlockGrid, fallback to legacy CPU
+                print("[tsdf-gpu] No VoxelBlockGrid in this Open3D build. Fallback to CPU.")
+                self.mode = "cpu"
+                self.backend = "legacy"
+
+        if self.mode == "cpu":
+            self.grid_fine = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=self.voxel_fine,
+                sdf_trunc=self.sdf_trunc_fine,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+            )
+            self.grid_coarse = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=self.voxel_coarse,
+                sdf_trunc=self.sdf_trunc_coarse,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+            )
+
+    @staticmethod
+    def _activate_blocks_if_needed(grid, block_coords):
+        if grid is None or block_coords is None:
+            return
+        try:
+            hm = grid.hashmap() if hasattr(grid, "hashmap") else None
+            if hm is None or (not hasattr(hm, "activate")):
+                return
+            try:
+                hm.activate(block_coords)
+                return
+            except Exception:
+                # retry on grid device
+                try:
+                    dev = grid.device if hasattr(grid, "device") else (hm.device if hasattr(hm, "device") else None)
+                    if dev is not None and hasattr(block_coords, "to"):
+                        hm.activate(block_coords.to(dev))
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _force_cpu(self):
+        if self.mode == "cpu":
+            return
+        print("[tsdf] CUDA runtime error during integrate -> switching to CPU TSDF and continuing.")
+        self.mode = "cpu"
+        self.backend = "legacy"
+        self.grid_fine = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=self.voxel_fine,
+            sdf_trunc=self.sdf_trunc_fine,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+        )
+        self.grid_coarse = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=self.voxel_coarse,
+            sdf_trunc=self.sdf_trunc_coarse,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+        )
+
+    def integrate(self, color_rgb: np.ndarray, depth_m: np.ndarray,
+                  K_3x3: np.ndarray, intr_legacy, T_cw: np.ndarray, depth_max: float):
+        """Integrate one RGB-D frame.
+        We maintain T_cw (camera->world). Open3D TSDF uses extrinsic as world->camera in most builds,
+        so we pass ext = inv(T_cw).
+        """
+        depth_max = float(depth_max)
+
+        if self.mode == "gpu":
+            try:
+                depth_np = depth_m.astype(np.float32, copy=False)
+                color_np = (color_rgb.astype(np.float32) / 255.0)  # float path (float depth, float color)
+
+                depth_t = o3d.t.geometry.Image(
+                    o3d.core.Tensor(depth_np, dtype=o3d.core.Dtype.Float32, device=self.dev)
+                )
+                color_t = o3d.t.geometry.Image(
+                    o3d.core.Tensor(color_np, dtype=o3d.core.Dtype.Float32, device=self.dev)
+                )
+
+                # NOTE: Many CUDA builds expect intr/extr on CPU
+                K_t = o3d.core.Tensor(K_3x3, dtype=o3d.core.Dtype.Float64)  # CPU
+                ext_t = o3d.core.Tensor(np.linalg.inv(T_cw), dtype=o3d.core.Dtype.Float64)  # CPU (world->cam)
+
+                def _do(grid, trunc_mult: float):
+                    if grid is None:
+                        return
+                    try:
+                        bc = grid.compute_unique_block_coordinates(
+                            depth_t, K_t, ext_t,
+                            depth_scale=1.0, depth_max=depth_max
+                        )
+                    except TypeError:
+                        bc = grid.compute_unique_block_coordinates(depth_t, K_t, ext_t)
+                    try:
+                        if hasattr(bc, "to"):
+                            bc = bc.to(self.dev)
+                    except Exception:
+                        pass
+                    self._activate_blocks_if_needed(grid, bc)
+
+                    try:
+                        grid.integrate(
+                            bc, depth_t, color_t, K_t, ext_t,
+                            depth_scale=1.0, depth_max=depth_max,
+                            trunc_voxel_multiplier=float(trunc_mult)
+                        )
+                    except TypeError:
+                        grid.integrate(
+                            bc, depth_t, color_t, K_t, ext_t,
+                            depth_scale=1.0, depth_max=depth_max
+                        )
+
+                _do(self.grid_fine, self.trunc_mult_fine)
+                _do(self.grid_coarse, self.trunc_mult_coarse)
+                return
+
+            except Exception as e:
+                # Catch CUDA runtime failure and switch to CPU (typical "CUDA runtime error: driver ...")
+                msg = str(e).lower()
+                if ("cuda" in msg) or ("cudautils" in msg) or ("driver" in msg) or ("memorymanagercuda" in msg):
+                    self._force_cpu()
+                else:
+                    raise
+
+        # CPU
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color_rgb),
+            o3d.geometry.Image(depth_m.astype(np.float32)),
+            depth_scale=1.0,
+            depth_trunc=depth_max,
+            convert_rgb_to_intensity=False
+        )
+        ext = np.linalg.inv(T_cw)  # world->cam
+        self.grid_fine.integrate(rgbd, intr_legacy, ext)
+        if self.grid_coarse is not None:
+            self.grid_coarse.integrate(rgbd, intr_legacy, ext)
+
+    def _extract_legacy_pcds(self, weight_thr: float):
+        empty = o3d.geometry.PointCloud()
+        wthr = float(weight_thr)
+
+        if self.mode == "gpu":
+            try:
+                pc_fine = self.grid_fine.extract_point_cloud(weight_threshold=wthr).to_legacy()
+            except TypeError:
+                pc_fine = self.grid_fine.extract_point_cloud().to_legacy()
+
+            if self.grid_coarse is not None:
+                try:
+                    pc_coarse = self.grid_coarse.extract_point_cloud(weight_threshold=wthr).to_legacy()
+                except TypeError:
+                    pc_coarse = self.grid_coarse.extract_point_cloud().to_legacy()
+            else:
+                pc_coarse = empty
+
+            return pc_fine, pc_coarse
+
+        # CPU legacy backend
+        pc_fine = self.grid_fine.extract_point_cloud()
+        pc_coarse = self.grid_coarse.extract_point_cloud() if (self.grid_coarse is not None) else empty
+        return pc_fine, pc_coarse
+
+    def extract_point_cloud(self, mode: str = None, weight_thr: float = None) -> o3d.geometry.PointCloud:
+        mode = (mode or "holefill").lower()
+        wthr = float(VBG_FINAL_WEIGHT_THR if (weight_thr is None) else weight_thr)
+
+        pc_f, pc_c = self._extract_legacy_pcds(wthr)
+
+        if mode == "fine":
+            return pc_f
+        if mode == "coarse":
+            return pc_c if len(pc_c.points) > 0 else pc_f
+
+        if len(pc_f.points) == 0:
+            return pc_c
+        if len(pc_c.points) == 0:
+            return pc_f
+
+        if mode == "merge":
+            pc_all = pc_f + pc_c
+            return pc_all.voxel_down_sample(self.voxel_fine * 1.2)
+
+        # holefill
+        d = np.asarray(pc_c.compute_point_cloud_distance(pc_f), dtype=np.float32)
+        keep = np.where(d > (self.voxel_coarse * 0.9))[0]
+        pc_fill = pc_c.select_by_index(keep) if keep.size > 0 else o3d.geometry.PointCloud()
+        pc_all = pc_f + pc_fill
+        return pc_all.voxel_down_sample(self.voxel_fine * 1.2)
+
+# ==========================
+# Frame loader (prefetch)
+# ==========================
+def estimate_depth_bounds_for_file(depth_path: Path, prev_near: float, prev_far: float, roi_rect=None):
+    d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    if d is None:
+        return prev_near, prev_far
+    dm = depth_to_meters(d).astype(np.float32)
+
+    H, W = dm.shape
+    if roi_rect is not None:
+        x, y, w, h = roi_rect
+        x0, x1 = max(0, x), min(W, x + w)
+        y0, y1 = max(0, y), min(H, y + h)
+    else:
+        x0, x1 = int(0.2*W), int(0.8*W)
+        y0, y1 = int(0.2*H), int(0.8*H)
+
+    crop = dm[y0:y1, x0:x1]
+    z = crop[(crop > 0) & np.isfinite(crop)]
+    if z.size < 500:
+        return prev_near, prev_far
+
+    ql = float(np.quantile(z, AUTO_Q_LOW))
+    qh = float(np.quantile(z, AUTO_Q_HIGH))
+    near = max(0.05, ql - AUTO_MARGIN_NEAR)
+    far  = max(near + 0.10, qh + AUTO_MARGIN_FAR)
+
+    near = AUTO_SMOOTH * prev_near + (1.0 - AUTO_SMOOTH) * near
+    far  = AUTO_SMOOTH * prev_far  + (1.0 - AUTO_SMOOTH) * far
+    far  = max(far, near + 0.10)
+    return near, far
+
+class FrameLoader(threading.Thread):
+    def __init__(self, colors, depths, roi_rect=None, roi_depth_halfwin=0.60):
+        super().__init__(daemon=True)
+        self.colors = colors
+        self.depths = depths
+        self.roi_rect = roi_rect
+        self.roi_depth_halfwin = roi_depth_halfwin
+        self.q = queue.Queue(maxsize=6)
+        self.stop_flag = False
+        self.auto_near = NEAR_CLIP
+        self.auto_far = DEPTH_TRUNC
+
+    def run(self):
+        try:
+            for cpath, dpath in zip(self.colors, self.depths):
+                if self.stop_flag:
+                    break
+                if AUTO_DEPTH:
+                    self.auto_near, self.auto_far = estimate_depth_bounds_for_file(
+                        dpath, self.auto_near, self.auto_far, roi_rect=(self.roi_rect if TRACK_USE_ROI else None)
+                    )
+                    # integration uses a minimum DEPTH_TRUNC so TSDF doesn't starve
+                    far_int = max(float(DEPTH_TRUNC), float(self.auto_far))
+                    color_rgb, dm_full, dm_track = make_frame(
+                        cpath, dpath,
+                        near_clip=float(self.auto_near),
+                        far_clip=float(far_int),
+                        roi_rect=self.roi_rect,
+                        roi_depth_halfwin=self.roi_depth_halfwin
+                    )
+                    self.q.put((cpath.name, dpath.name, color_rgb, dm_full, dm_track, float(self.auto_near), float(far_int)))
+                else:
+                    color_rgb, dm_full, dm_track = make_frame(
+                        cpath, dpath,
+                        near_clip=float(NEAR_CLIP),
+                        far_clip=float(DEPTH_TRUNC),
+                        roi_rect=self.roi_rect,
+                        roi_depth_halfwin=self.roi_depth_halfwin
+                    )
+                    self.q.put((cpath.name, dpath.name, color_rgb, dm_full, dm_track, float(NEAR_CLIP), float(DEPTH_TRUNC)))
+        except Exception as e:
+            self.q.put(("__ERR__", str(e), None, None, None, None, None))
+
+# ==========================
+# Live visualization
+# ==========================
+def make_visualizer():
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="GT+ICP TSDF (Live Preview)", width=1100, height=800, visible=True)
+
+    coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
+    vis.add_geometry(coord)
+
+    pcd_show = o3d.geometry.PointCloud()
+    vis.add_geometry(pcd_show)
+
+    traj_odo = o3d.geometry.LineSet()
+    traj_fused = o3d.geometry.LineSet()
+    vis.add_geometry(traj_odo)
+    vis.add_geometry(traj_fused)
+
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0, 0, 0])
+    opt.point_size = float(LIVE_VIS_POINT_SIZE)
+
+    return vis, pcd_show, traj_odo, traj_fused
+
+def vis_poll(vis) -> bool:
+    if vis is None:
+        return True
+    alive = vis.poll_events()
+    vis.update_renderer()
+    return bool(alive)
+
+def update_lineset(ls: o3d.geometry.LineSet, pts_np: np.ndarray, color_rgb=(0.0, 1.0, 0.0)):
+    if ls is None:
+        return
+    if pts_np.shape[0] < 2:
+        ls.points = o3d.utility.Vector3dVector(pts_np)
+        ls.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+        ls.colors = o3d.utility.Vector3dVector(np.zeros((0, 3), dtype=np.float64))
+        return
+    lines = np.stack([np.arange(pts_np.shape[0] - 1), np.arange(1, pts_np.shape[0])], axis=1).astype(np.int32)
+    cols = np.tile(np.array(color_rgb, dtype=np.float64)[None, :], (lines.shape[0], 1))
+    ls.points = o3d.utility.Vector3dVector(pts_np.astype(np.float64))
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(cols)
+
+def vis_update(tsdf_obj, vis, pcd_show, traj_odo, traj_fused, traj_pts_odo, traj_pts_fused, view_state):
+    if vis is None or pcd_show is None:
+        return
+    try:
+        p = tsdf_obj.extract_point_cloud(mode=LIVE_VIS_MODE, weight_thr=VBG_PREVIEW_WEIGHT_THR)
+        if len(p.points) == 0:
+            return
+        if LIVE_VIS_VOXEL_DS and LIVE_VIS_VOXEL_DS > 0:
+            p = p.voxel_down_sample(LIVE_VIS_VOXEL_DS)
+
+        pcd_show.points = p.points
+        pcd_show.colors = p.colors
+        vis.update_geometry(pcd_show)
+
+        update_lineset(traj_odo, np.asarray(traj_pts_odo), color_rgb=(1.0, 0.2, 0.2))
+        update_lineset(traj_fused, np.asarray(traj_pts_fused), color_rgb=(0.2, 1.0, 0.2))
+        vis.update_geometry(traj_odo)
+        vis.update_geometry(traj_fused)
+
+        if (not view_state["inited"]) and len(pcd_show.points) > 0:
+            vis.reset_view_point(True)
+            view_state["inited"] = True
+    except Exception as e:
+        print("[vis] update failed:", repr(e))
+
+# ==========================
+# Main
+# ==========================
+def main():
+    if not SEQ_DIR.exists():
+        raise FileNotFoundError(f"[path] SEQ_DIR 不存在: {SEQ_DIR}")
+
+    colors, depths = list_rgbd_paths(SEQ_DIR)
+    total = len(colors)
+    print(f"[io] total frames = {total}")
+
+    # ---------- GT ----------
+    gt_data = load_tum_groundtruth(SEQ_DIR / "groundtruth.txt")
+    USE_GT = (gt_data is not None)
+
+    # ---------- Bootstrap + ROI selection ----------
+    start = 0
+    roi_rect = None
+    roi_depth_halfwin = 0.60
+    did_roi = False
+    near0, far0 = NEAR_CLIP, DEPTH_TRUNC
+
+    while start < total:
+        c0, d0 = colors[start], depths[start]
+
+        if USE_INTERACTIVE_ROI_ONCE and (not did_roi):
+            rgb0 = cv2.imread(str(c0), cv2.IMREAD_COLOR)
+            if rgb0 is None:
+                raise FileNotFoundError(f"RGB read failed: {c0}")
+            disp = rgb0.copy()
+            cv2.putText(disp, "Select ROI for TRACKING (bouquet). ENTER/SPACE confirm, c cancel",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            roi = cv2.selectROI("ROI selector", disp, fromCenter=False, showCrosshair=True)
+            cv2.destroyWindow("ROI selector")
+            x, y, w, h = map(int, roi)
+            if w > 2 and h > 2:
+                roi_rect = (x, y, w, h)
+                print(f"[roi] selected rect = {roi_rect} (tracking only={TRACK_USE_ROI}, integrate_roi={INTEGRATE_USE_ROI})")
+            else:
+                print("[roi] invalid selection -> no ROI")
+                roi_rect = None
+            did_roi = True
+
+        if AUTO_DEPTH:
+            near0, far0 = estimate_depth_bounds_for_file(d0, near0, far0, roi_rect=(roi_rect if TRACK_USE_ROI else None))
+        far_int = max(float(DEPTH_TRUNC), float(far0))
+
+        color0_rgb, dm0_full, dm0_track = make_frame(
+            c0, d0, near_clip=float(near0), far_clip=float(far_int),
+            roi_rect=roi_rect, roi_depth_halfwin=roi_depth_halfwin
+        )
+
+        z0 = dm0_full[(dm0_full > 0) & np.isfinite(dm0_full)]
+        print(f"[bootstrap] k0={start}, nz_full={z0.size}, near={near0:.2f}, far_int={far_int:.2f}")
+        if z0.size >= 5000:
+            break
+        start += 1
+
+    if start >= total:
+        raise RuntimeError("没有找到有效深度的起始帧（全是0深度）")
+
+    H, W = dm0_full.shape
+    Kd = load_intrinsics_dataset_aware(W, H, SEQ_DIR)
+    K = np.array([[Kd["fx"], 0, Kd["cx"]],
+                  [0, Kd["fy"], Kd["cy"]],
+                  [0, 0, 1]], np.float64)
+    intr = o3d.camera.PinholeCameraIntrinsic(W, H, Kd["fx"], Kd["fy"], Kd["cx"], Kd["cy"])
+    print(f"[K] fx={Kd['fx']:.1f} fy={Kd['fy']:.1f} cx={Kd['cx']:.1f} cy={Kd['cy']:.1f}")
+
+    # Make intrinsics available to make_frame()/plane suppression
+    global K_GLOBAL, K_READY
+    K_GLOBAL = K.copy()
+    K_READY = True
+
+    # ---------- Align GT so first GT pose becomes Identity ----------
+    GT_TIME_SHIFT = 0.0
+    S_align = np.eye(4, dtype=np.float64)
+    if USE_GT:
+        t0 = _try_float_stem(colors[start])
+        if t0 is None:
+            print("[gt] cannot parse start timestamp (GT disabled)")
+            USE_GT = False
+        else:
+            ts_gt, _ = gt_data
+            j0 = int(np.argmin(np.abs(ts_gt - t0)))
+            GT_TIME_SHIFT = float(ts_gt[j0] - t0)
+            print(f"[gt] time shift estimated: {GT_TIME_SHIFT:.6f}s")
+            T_gt0 = query_gt_nearest(gt_data, t0 + GT_TIME_SHIFT, max_dt=max(GT_MAX_DT, 0.5))
+            if T_gt0 is None:
+                print("[gt] cannot get initial GT pose (GT disabled)")
+                USE_GT = False
+            else:
+                S_align = np.linalg.inv(T_gt0)
+                print("[gt] enabled, aligned so first GT pose is Identity")
+
+    # ---------- TSDF ----------
+    tsdf = TSDFWrapper(VOXEL_LEN, VOXEL_LEN * SDF_TRUNC_K, coarse_factor=3.0)
+
+    # ---------- UI ----------
+    cv2.namedWindow("Left RGB", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Left RGB", 640, 480)
+    cv2.imshow("Left RGB", cv2.cvtColor(color0_rgb, cv2.COLOR_RGB2BGR))
+
+    vis = None
+    pcd_show = None
+    traj_odo = None
+    traj_fused = None
+    view_state = {"inited": False}
+
+    if LIVE_VIS:
+        o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+        vis, pcd_show, traj_odo, traj_fused = make_visualizer()
+
+    # ---------- Poses ----------
+    T_cw = np.eye(4, dtype=np.float64)      # fused pose (camera->world)
+    T_cw_odo = np.eye(4, dtype=np.float64)  # odometry-only
+
+    # ---------- Occlusion reference (foreground Z-buffer) ----------
+    ref_pts_w = np.empty((0, 3), dtype=np.float32)
+    ref_frames = 0            # number of successful integrations used for building reference
+    ref_ready = False
+    occ_rej_total = 0
+
+    # integrate the first frame immediately
+    far_int0 = max(float(DEPTH_TRUNC), float(far0))
+    tsdf.integrate(color0_rgb, dm0_full, K, intr, T_cw, depth_max=far_int0)
+    processed = 1
+
+
+    # collect occlusion reference points from the early part (when vase exists)
+    if OCCLUSION_GATING:
+        pts = collect_ref_points_from_depth(
+            dm0_full, roi_rect, K, T_cw,
+            center_frac=OCCLUSION_REF_CENTER_FRAC,
+            exclude_bottom_frac=OCCLUSION_REF_EXCLUDE_BOTTOM_FRAC
+        )
+        if pts is not None and pts.shape[0] > 0:
+            ref_pts_w = pts if ref_pts_w.size == 0 else np.vstack([ref_pts_w, pts])
+            ref_frames += 1
+            if (ref_frames % 20 == 0) or (ref_pts_w.shape[0] > int(OCCLUSION_REF_MAX_PTS) * 2):
+                ref_pts_w = _voxel_downsample_points_np(ref_pts_w, OCCLUSION_REF_VOXEL, OCCLUSION_REF_MAX_PTS)
+            if (not ref_ready) and (ref_frames >= int(OCCLUSION_REF_INIT_FRAMES)) and (ref_pts_w.shape[0] >= 5000):
+                ref_pts_w = _voxel_downsample_points_np(ref_pts_w, OCCLUSION_REF_VOXEL, OCCLUSION_REF_MAX_PTS)
+                ref_ready = True
+                print(f"[occ] reference ready: frames={ref_frames} pts={ref_pts_w.shape[0]}")
+
+    def save_snapshot(step: int, reason: str = "snap"):
+        """Export a mid-run TSDF extraction for debugging."""
+        if not SAVE_SNAPSHOTS:
+            return
+        try:
+            pc = tsdf.extract_point_cloud(mode=SNAPSHOT_MODE, weight_thr=SNAPSHOT_WEIGHT_THR)
+        except Exception as e:
+            print(f"[snapshot] extract failed: {e}")
+            return
+        # keep fine detail for the foreground; optionally downsample for size
+        ds = SNAPSHOT_VOXEL_DS if 'SNAPSHOT_VOXEL_DS' in globals() else LIVE_VIS_VOXEL_DS
+        if ds and ds > 0:
+            try:
+                pc = pc.voxel_down_sample(float(ds))
+            except Exception:
+                pass
+        out = SNAPSHOT_DIR / f"{reason}_{step:06d}.ply"
+        try:
+            o3d.io.write_point_cloud(str(out), pc)
+            print(f"[snapshot] saved: {out}")
+        except Exception as e:
+            print(f"[snapshot] write failed: {e}")
+
+    print("[integrate] first frame integrated")
+
+    traj_pts_odo = [T_cw_odo[:3, 3].copy()]
+    traj_pts_fused = [T_cw[:3, 3].copy()]
+
+    if LIVE_VIS:
+        vis_update(tsdf, vis, pcd_show, traj_odo, traj_fused, traj_pts_odo, traj_pts_fused, view_state)
+        vis_poll(vis)
+
+    # ---------- Prefetch frames ----------
+    loader = FrameLoader(colors[start + 1:], depths[start + 1:], roi_rect=roi_rect, roi_depth_halfwin=roi_depth_halfwin)
+    loader.auto_near = float(near0)
+    loader.auto_far  = float(far_int0)
+    loader.start()
+
+    # tracking keyframe cache (use TRACK depth)
+    trk_color = color0_rgb
+    trk_dm_track = dm0_track
+    trk_far = far_int0
+
+    accepted_kf = 0
+    gt_hit = gt_none = gt_fused_cnt = gt_reject = 0
+    tsdf_gt_used = 0
+    tsdf_gt_missing = 0
+
+    # Debug counters
+    skip = dict(low_pts=0, icp_fail=0, icp_bad=0, int_empty=0, fg_missing=0, read=0)
+
+    try:
+        k = start + 1
+        while k < total:
+            if LIVE_VIS and (not vis_poll(vis)):
+                break
+
+            try:
+                item = loader.q.get(timeout=0.5)
+            except queue.Empty:
+                cv2.waitKey(1)
+                if not loader.is_alive():
+                    break
+                continue
+
+            if item[0] == "__ERR__":
+                print("[loader-error]", item[1])
+                break
+
+            name_c, name_d, color_rgb, dm_full, dm_track, near_auto, far_int = item
+            cv2.imshow("Left RGB", cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR))
+
+            if (k % KEYFRAME_STEP) != 0:
+                k += 1
+                continue
+
+            # Build point clouds from TRACK depth (for ICP robustness)
+            rgbd_prev = build_o3d_rgbd(trk_color, trk_dm_track, depth_trunc=float(trk_far))
+            rgbd_cur  = build_o3d_rgbd(color_rgb, dm_track, depth_trunc=float(far_int))
+
+            pc_prev = make_pcd_from_rgbd_o3d(rgbd_prev, intr, voxel=0.014)
+            pc_cur  = make_pcd_from_rgbd_o3d(rgbd_cur,  intr, voxel=0.014)
+
+            if len(pc_prev.points) < MIN_PTS_FOR_ICP or len(pc_cur.points) < MIN_PTS_FOR_ICP:
+                skip["low_pts"] += 1
+                k += 1
+                cv2.waitKey(1)
+                continue
+
+            # init candidates
+            init_candidates = [("I", np.eye(4, dtype=np.float64))]
+            T_pnp = orb_pnp_init_cuda(trk_color, trk_dm_track, color_rgb, K)
+            if (T_pnp is not None) and reasonable(T_pnp, 0.50, 35.0):
+                init_candidates.append(("pnp", T_pnp))
+
+            # choose the init that gives best colored ICP outcome (fast approach: try pnp first then identity)
+            reg = None
+            best_name = "I"
+
+            # Try in order: PnP -> I
+            for nm, initT in sorted(init_candidates, key=lambda kv: 0 if kv[0] == "pnp" else 1):
+                reg = colored_icp_multiscale(pc_prev, pc_cur, init=initT) if reasonable(initT, 0.50, 35.0) else None
+                if reg is None:
+                    reg = icp_point2plane_multiscale_robust(pc_prev, pc_cur, init=initT)
+                if reg is not None:
+                    best_name = nm
+                    break
+
+            if reg is None:
+                skip["icp_fail"] += 1
+                k += 1
+                cv2.waitKey(1)
+                continue
+
+            Tij = reg.transformation
+            fit = float(getattr(reg, "fitness", 0.0))
+            rmse = float(getattr(reg, "inlier_rmse", 999.0))
+            ok = (fit >= ICP_MIN_FIT_ODO) and (rmse <= ICP_MAX_RMSE_ODO) and reasonable(Tij, ODOM_MAX_T, ODOM_MAX_R_DEG)
+
+            if not ok:
+                skip["icp_bad"] += 1
+                k += 1
+                cv2.waitKey(1)
+                continue
+
+            # Accept tracking: update both odometry-only and fused poses
+            T_cw_odo = T_cw_odo @ np.linalg.inv(Tij)
+            T_cw     = T_cw     @ np.linalg.inv(Tij)
+            accepted_kf += 1
+
+            # Update tracking cache to CURRENT frame (use TRACK depth for next ICP)
+            trk_color = color_rgb
+            trk_dm_track = dm_track
+            trk_far = far_int
+
+            # Ground-truth pose queries
+            T_gt_aligned = None          # used for optional GT fusion of tracking pose
+            T_gt_aligned_tsdf = None     # used for TSDF integration when TSDF_POSE_SOURCE == 'gt'
+
+            # If TSDF is configured to use GT, query GT every accepted keyframe (interpolated).
+            if USE_GT and TSDF_POSE_SOURCE == 'gt':
+                t_img = _try_float_stem(Path(name_d))  # use depth timestamp for pose
+                if t_img is not None:
+                    T_gt = query_gt_interp(gt_data, t_img + GT_TIME_SHIFT)
+                    T_gt_aligned_tsdf = S_align @ T_gt
+
+            # Optional GT fusion
+            if USE_GT and (accepted_kf % GT_STRIDE == 0):
+                t_img = _try_float_stem(Path(name_c))
+                if t_img is not None:
+                    T_gt = query_gt_nearest(gt_data, t_img + GT_TIME_SHIFT, max_dt=GT_MAX_DT)
+                    if T_gt is None:
+                        gt_none += 1
+                    else:
+                        gt_hit += 1
+                        T_gt_aligned = S_align @ T_gt
+                        T_cw_new, fused, err_r, err_t = gt_fuse_pose(T_cw, T_gt_aligned)
+                        if fused:
+                            gt_fused_cnt += 1
+                            T_cw = T_cw_new
+                        else:
+                            gt_reject += 1
+
+            # Integrate EVERY accepted tracking step using FULL depth (dm_full)
+            # Choose integration pose
+            do_integrate = True
+            if TSDF_POSE_SOURCE == 'gt':
+                if T_gt_aligned_tsdf is None:
+                    tsdf_gt_missing += 1
+                    do_integrate = False
+                else:
+                    T_int = T_gt_aligned_tsdf
+                    tsdf_gt_used += 1
+            elif TSDF_POSE_SOURCE in ('icp', 'odo'):
+                T_int = T_cw_odo
+            else:
+                T_int = T_cw
+
+            # Integrate (dm_full has already been ROI/masked if INTEGRATE_USE_ROI is True)
+            # Extra safety: if the locked ROI band contains too few pixels, it usually means
+            # the vase/flowers depth is missing and only background remains -> skip integration to prevent "washout".
+            nz_int = int(np.count_nonzero(dm_full > 0))
+            if INTEGRATE_USE_ROI:
+                if nz_int < 300:
+                    skip["int_empty"] += 1
+                    k += 1
+                    cv2.waitKey(1)
+                    continue
+                if INTEGRATE_ROI_DEPTH_WINDOW and FG_DEPTH_LOCK and (INTEGRATE_MIN_KEEP_PX is not None):
+                    if nz_int < int(INTEGRATE_MIN_KEEP_PX):
+                        skip["fg_missing"] += 1
+                        k += 1
+                        cv2.waitKey(1)
+                        continue
+            if do_integrate:
+                # ---------- (A) build occlusion reference from early integrations ----------
+                if OCCLUSION_GATING and (not ref_ready):
+                    pts = collect_ref_points_from_depth(
+                        dm_full, roi_rect, K, T_int,
+                        center_frac=OCCLUSION_REF_CENTER_FRAC,
+                        exclude_bottom_frac=OCCLUSION_REF_EXCLUDE_BOTTOM_FRAC
+                    )
+                    if pts is not None and pts.shape[0] > 0:
+                        ref_pts_w = pts if ref_pts_w.size == 0 else np.vstack([ref_pts_w, pts])
+                        ref_frames += 1
+                        if (ref_frames % 20 == 0) or (ref_pts_w.shape[0] > int(OCCLUSION_REF_MAX_PTS) * 2):
+                            ref_pts_w = _voxel_downsample_points_np(ref_pts_w, OCCLUSION_REF_VOXEL, OCCLUSION_REF_MAX_PTS)
+                        if (not ref_ready) and (ref_frames >= int(OCCLUSION_REF_INIT_FRAMES)) and (ref_pts_w.shape[0] >= 5000):
+                            ref_pts_w = _voxel_downsample_points_np(ref_pts_w, OCCLUSION_REF_VOXEL, OCCLUSION_REF_MAX_PTS)
+                            ref_ready = True
+                            print(f"[occ] reference ready: frames={ref_frames} pts={ref_pts_w.shape[0]}")
+
+                # ---------- (B) occlusion gating: reject background behind reference ----------
+                if OCCLUSION_GATING and ref_ready:
+                    zbuf, hits = project_ref_zbuffer(
+                        ref_pts_w, roi_rect, K, T_int,
+                        dm_full.shape[:2],
+                        max_project_pts=int(OCCLUSION_REF_MAX_PTS)
+                    )
+                    if (zbuf is not None) and (hits >= int(OCCLUSION_MIN_HITS)):
+                        rej = apply_occlusion_gating(dm_full, zbuf, roi_rect, OCCLUSION_TOL)
+                        occ_rej_total += int(rej)
+                        if OCCLUSION_DEBUG and (processed % 50 == 0):
+                            print(f"[occ] step={processed:04d} hits={hits} rej={rej} total_rej={occ_rej_total}")
+
+                tsdf.integrate(color_rgb, dm_full, K, intr, T_int, depth_max=float(far_int))
+                processed += 1
+            else:
+                # Missing GT pose: do NOT integrate with a drifting pose (prevents small-object washout)
+                continue
+
+            # Optional snapshots at fixed counts (preferred) or periodic
+            do_snapshot = False
+            if SAVE_SNAPSHOTS:
+                if SNAPSHOT_AT is not None:
+                    do_snapshot = processed in set(SNAPSHOT_AT)
+                elif SNAPSHOT_EVERY and int(SNAPSHOT_EVERY) > 0:
+                    do_snapshot = (processed % int(SNAPSHOT_EVERY) == 0)
+            if do_snapshot:
+                save_snapshot(processed, reason="auto")
+
+            if STOP_AFTER_INTEGRATIONS is not None and processed >= int(STOP_AFTER_INTEGRATIONS):
+                print(f"[stop] STOP_AFTER_INTEGRATIONS={STOP_AFTER_INTEGRATIONS} reached at processed={processed} -> exit loop")
+                break
+
+            traj_pts_odo.append(T_cw_odo[:3, 3].copy())
+            traj_pts_fused.append(T_cw[:3, 3].copy())
+
+            if (processed % 10) == 0:
+                print(f"[integrate] processed={processed:5d}, k={k:04d}, init={best_name}, fit={fit:.3f}, rmse={rmse:.4f}  "
+                      f"skip(low_pts={skip['low_pts']}, icp_fail={skip['icp_fail']}, icp_bad={skip['icp_bad']}, int_empty={skip['int_empty']}, fg_missing={skip['fg_missing']})")
+
+            if LIVE_VIS and (processed % LIVE_UPDATE_EVERY_INT) == 0:
+                vis_update(tsdf, vis, pcd_show, traj_odo, traj_fused, traj_pts_odo, traj_pts_fused, view_state)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("s"), ord("S")) and SNAPSHOT_ON_KEY:
+                save_snapshot(processed, reason="key")
+            elif key in (ord("x"), ord("X")):
+                # export a snapshot and exit (useful for taking a mid-run reference model)
+                save_snapshot(processed, reason="stop")
+                break
+            elif key in (27, ord("q"), ord("Q")):
+                break
+
+            k += 1
+
+        print(f"[gt-stat] hit={gt_hit} none={gt_none} fused={gt_fused_cnt} reject={gt_reject}")
+        print(f"[skip-stat] {skip}")
+        print(f"[tsdf-gt] used={tsdf_gt_used} missing={tsdf_gt_missing}")
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        pcd_path = OUT_DIR / f"pcd_final_{ts}.ply"
+        pc_final = tsdf.extract_point_cloud(mode=FINAL_EXPORT_MODE, weight_thr=FINAL_EXPORT_WEIGHT_THR)
+        o3d.io.write_point_cloud(str(pcd_path), pc_final)
+        print(f"[final] saved: {pcd_path}")
+
+        if LIVE_VIS:
+            print("[vis] showing final model (close Open3D window to exit)")
+            vis_update(tsdf, vis, pcd_show, traj_odo, traj_fused, traj_pts_odo, traj_pts_fused, view_state)
+            while True:
+                if not vis_poll(vis):
+                    break
+                cv2.waitKey(1)
+
+    except Exception:
+        logp = OUT_DIR / "live_crash.log"
+        with open(logp, "a", encoding="utf-8") as f:
+            f.write("".join(traceback.format_exc()) + "\n")
+        print(f"[fatal] 运行异常，详见日志 {logp}")
+        print(traceback.format_exc())
+
+    finally:
+        try:
+            if vis is not None:
+                vis.destroy_window()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+        # release CUDA cache (best effort)
+        try:
+            if HAS_O3D_CUDA and hasattr(o3d, "core") and hasattr(o3d.core, "cuda"):
+                try:
+                    if hasattr(o3d.core.cuda, "synchronize"):
+                        o3d.core.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(o3d.core.cuda, "release_cache"):
+                        o3d.core.cuda.release_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
